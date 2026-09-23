@@ -1,0 +1,1072 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cosmos</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}canvas{display:block;position:fixed;inset:0;width:100%;height:100%}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+// ============================================================ GLSL
+const COMMON = `
+precision highp float; precision highp int;
+uniform float uTime;
+uniform vec3 uCamR, uCamU, uCamF; uniform float uTan; uniform vec2 uRes;
+uint hu(uint x){x^=x>>16u;x*=0x7feb352du;x^=x>>15u;x*=0x846ca68bu;x^=x>>16u;return x;}
+float hf(uint x){return float(hu(x)>>8u)*(1./16777216.);}
+float h13(vec3 p){p=fract(p*vec3(.1031,.1030,.0973));p+=dot(p,p.yzx+33.33);return fract((p.x+p.y)*p.z);}
+vec3 h33(vec3 p){p=fract(p*vec3(.1031,.1030,.0973));p+=dot(p,p.yxz+33.33);return fract((p.xxy+p.yxx)*p.zyx);}
+float n3(vec3 p){vec3 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ return mix(mix(mix(h13(i),h13(i+vec3(1,0,0)),f.x),mix(h13(i+vec3(0,1,0)),h13(i+vec3(1,1,0)),f.x),f.y),
+            mix(mix(h13(i+vec3(0,0,1)),h13(i+vec3(1,0,1)),f.x),mix(h13(i+vec3(0,1,1)),h13(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fbm(vec3 p,int o){float s=0.,a=.5,n=0.;for(int i=0;i<7;i++){if(i>=o)break;s+=a*n3(p);n+=a;p=p*2.03+vec3(1.7,9.2,3.1);a*=.5;}return s/n;}
+vec3 bb(float T){float x=clamp(log2(T/1000.)/5.,0.,1.);
+ vec3 a=vec3(1.,.28,.06),b=vec3(1.,.62,.32),c=vec3(1.,.93,.84),d=vec3(.78,.86,1.),e=vec3(.58,.7,1.);
+ if(x<.25)return mix(a,b,x/.25); if(x<.45)return mix(b,c,(x-.25)/.2); if(x<.6)return mix(c,d,(x-.45)/.15); return mix(d,e,(x-.6)/.4);}
+vec3 camRay(vec2 fc){vec2 s=(fc*2.-uRes)/uRes.y;return normalize(uCamF+s.x*uTan*uCamR+s.y*uTan*uCamU);}
+vec2 isph(vec3 ro,vec3 rd,vec3 c,float R){vec3 oc=ro-c;float b=dot(oc,rd);float cc=dot(oc,oc)-R*R;float h=b*b-cc;if(h<0.)return vec2(-1.);h=sqrt(h);return vec2(-b-h,-b+h);}
+`;
+
+const FSQ_VS = `#version 300 es
+void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.-1.,0.,1.);}`;
+
+// ------------------------------------------------------------ procedural sky (shared by sky + black hole)
+const SKYLIB = `
+uniform vec4 uSkyA; // stars, galactic band, distant galaxies, haze
+uniform vec4 uSkyB; // star reveal, cmb, -, -
+uniform mat3 uSkyRot;
+uniform vec4 uGRB;   // dir, intensity
+uniform vec4 uRip; uniform float uRipR; // spacetime ripple: centre dir, amplitude / angular radius
+uniform vec4 uLensGal; // distant galaxy to be lensed: dir, brightness
+vec3 rippleDir(vec3 d){
+ if(uRip.w<=0.)return d;
+ float ang=acos(clamp(dot(d,uRip.xyz),-1.,1.)); float x=ang-uRipR;
+ float w=exp(-x*x*18.)*sin(x*26.)*uRip.w;
+ vec3 t=d-uRip.xyz*dot(d,uRip.xyz); t/=max(length(t),1e-5);
+ return normalize(d+t*w*.06);
+}
+vec3 starL(vec3 d,float S,float dens,float px,float seed,float br){
+ vec3 g=d*S,id=floor(g),f=g-id; vec3 h=h33(id+seed);
+ if(h.x>dens||h.z>uSkyB.x)return vec3(0);
+ vec3 sp=.25+.5*h33(id*1.7+seed+3.1); vec3 dd=f-sp; dd-=d*dot(dd,d);
+ float r2=dot(dd,dd)/(S*S); float w=px*px*.55;
+ float L=.08+pow(h.y,9.)*30.;
+ float T=2700.+pow(fract(h.y*13.7+h.z*7.1),2.2)*24000.;
+ float tw=.85+.15*sin(uTime*(2.+h.z*5.)+h.x*50.);
+ return bb(T)*L*exp(-r2/w)*tw*br;
+}
+vec3 sky(vec3 d0,float px){
+ vec3 d=rippleDir(d0); vec3 q=uSkyRot*d; vec3 col=vec3(0);
+ col+=(vec3(.004,.0035,.006)+vec3(.02,.012,.01)*(fbm(d*5.,3)-.4))*uSkyB.y;
+ if(uSkyA.y>0.){
+  float b=q.y, band=exp(-b*b*28.); vec3 cq=q-vec3(1,0,0); float core=exp(-dot(cq,cq)*2.2);
+  float n=fbm(q*6.,5); float dust=smoothstep(.45,.72,fbm(q*11.+4.,5))*exp(-b*b*260.);
+  vec3 bc=mix(vec3(.5,.6,.9),vec3(1.,.76,.48),core);
+  col+=bc*(band*(.2+.9*n)+core*exp(-b*b*70.))*(1.-dust*.92)*uSkyA.y*.1;
+ }
+ if(uSkyA.w>0.){float n=fbm(q*2.5+9.,4);col+=mix(vec3(.25,.05,.2),vec3(.03,.15,.22),fbm(q*1.5,3))*n*n*n*uSkyA.w*.5;}
+ if(uSkyA.x>0.){
+  float bandB=1.+uSkyA.y*1.5*exp(-q.y*q.y*25.);
+  col+=starL(d,60.,.35,px,1.,1.4)*uSkyA.x;
+  col+=starL(d,170.,.22,px,3.,.45)*uSkyA.x;
+  col+=starL(d,430.,min(.06*bandB*bandB,.5),px,5.,.14)*uSkyA.x;
+ }
+ if(uSkyA.z>0.){vec3 g=d*22.,id=floor(g),f=g-id;vec3 h=h33(id+11.);
+  if(h.x<.3){vec3 c=.3+.4*h33(id+2.);vec3 dd=f-c;dd-=d*dot(dd,d);
+   vec3 ax=normalize(cross(d,h33(id+5.)-.5));float u=dot(dd,ax),v=length(dd-ax*u);float sz=.012+.035*pow(h.y,3.);
+   col+=mix(vec3(1.,.8,.6),vec3(.7,.8,1.),h.z)*exp(-(u*u+v*v/.12)/(sz*sz))*uSkyA.z*(.2+h.y)*.5;}}
+ if(uLensGal.w>0.){vec3 L=uLensGal.xyz;float cd=dot(d,L);
+  if(cd>0.){vec3 t1=normalize(cross(L,vec3(0,1,.001))),t2=cross(L,t1);vec2 uv=vec2(dot(d,t1),dot(d,t2))/.06;uv.y/=.6;
+   float r=length(uv),th=atan(uv.y,uv.x);float arms=.5+.5*cos(2.*th-5.*log(r+.02));
+   float I=exp(-r*2.6)*(.3+.9*arms*smoothstep(.05,.3,r))+exp(-r*r*50.)*1.5;
+   col+=mix(vec3(.7,.8,1.),vec3(1.,.85,.6),exp(-r*3.))*I*uLensGal.w;}}
+ if(uGRB.w>0.){float a=acos(clamp(dot(d,uGRB.xyz),-1.,1.));
+  col+=vec3(.8,.9,1.)*uGRB.w*(exp(-a*a*6000.)*30.+exp(-a*a*80.)*.6+exp(-a*6.)*.1);}
+ return col;
+}`;
+
+const SKY_FS = `#version 300 es
+${COMMON}${SKYLIB}
+out vec4 o;
+void main(){o=vec4(sky(camRay(gl_FragCoord.xy),2.*uTan/uRes.y),1.);}`;
+
+// ------------------------------------------------------------ black holes: photon geodesics + accretion disks
+const BH_FS = `#version 300 es
+${COMMON}${SKYLIB}
+uniform vec4 uBH[2]; uniform vec4 uDN[2]; uniform vec4 uDP; uniform float uHaze;
+out vec4 o;
+vec4 disk(vec3 hp,vec3 c,float rs,vec3 n,float rout,vec3 vel,float seed){
+ vec3 rel=(hp-c)/rs; float r=length(rel); float rin=uDP.x;
+ if(r<rin||r>rout)return vec4(0);
+ vec3 t1=normalize(cross(n,abs(n.y)<.9?vec3(0,1,0):vec3(1,0,0))),t2=cross(n,t1);
+ float ph=atan(dot(rel,t2),dot(rel,t1)); float a=ph-uDP.z*pow(r,-1.5)*uTime;
+ vec3 np=vec3(cos(a)*r*1.3,sin(a)*r*1.3,r*.7+seed);
+ float den=smoothstep(.3,.8,fbm(np*1.4,4)); float streak=.55+.45*sin(r*9.+den*6.);
+ float edge=smoothstep(rin,rin*1.3,r)*smoothstep(rout,rout*.55,r);
+ float T=uDP.w*pow(r/rin,-.75);
+ vec3 vd=normalize(cross(n,rel)); float beta=min(sqrt(.5/r),.7);
+ float D=sqrt(1.-beta*beta)/(1.-beta*dot(vd,-vel)); float Df=D*sqrt(max(1.-1./r,.02));
+ vec3 e=bb(T*Df)*pow(Df,3.)*den*streak*edge*uDP.y*(1.6*pow(rin/r,1.3)+.08);
+ return vec4(e,clamp(den*edge*1.2,0.,.93));
+}
+void main(){
+ vec3 rd=camRay(gl_FragCoord.xy); float px=2.*uTan/uRes.y;
+ vec3 pos=vec3(0),vel=rd,col=vec3(0); float Tr=1.; bool cap=false;
+ float rsM=max(uBH[0].w,uBH[1].w);
+ for(int i=0;i<130;i++){
+  vec3 acc=vec3(0); float dn=1e20, rn=rsM, hz=0.;
+  for(int k=0;k<2;k++){ float rs=uBH[k].w; if(rs<=0.)continue;
+   vec3 r=pos-uBH[k].xyz; float d=length(r); if(d<rs)cap=true;
+   vec3 h=cross(r,vel); acc-=1.5*rs*dot(h,h)*r/(d*d*d*d*d);
+   if(d<dn){dn=d;rn=rs;} hz+=exp(-d/(rs*4.))/rs; }
+  if(cap)break;
+  float dt=max(dn*.07,rn*.025);
+  vec3 pp=pos; vel=normalize(vel+acc*dt); pos+=vel*dt;
+  col+=Tr*vec3(1.,.5,.22)*uHaze*hz*dt*.02;
+  for(int k=0;k<2;k++){ float rs=uBH[k].w; if(rs<=0.||uDN[k].w<=uDP.x)continue;
+   vec3 n=uDN[k].xyz,c=uBH[k].xyz; float s0=dot(pp-c,n),s1=dot(pos-c,n);
+   if(s0*s1<0.){vec3 hp=pp+(pos-pp)*(s0/(s0-s1)); vec4 e=disk(hp,c,rs,n,uDN[k].w,vel,float(k)*7.);
+    col+=Tr*e.rgb; Tr*=1.-e.a;} }
+  if(Tr<.01||dn>rsM*350.)break;
+ }
+ if(!cap)col+=Tr*sky(vel,px);
+ o=vec4(col,1.);
+}`;
+
+// ------------------------------------------------------------ analytic bodies: stars, planets, moons, pulsars, a city world
+const BODY_FS = `#version 300 es
+${COMMON}
+uniform int uNB; uniform vec4 uBP[6]; uniform vec4 uBT[6]; uniform vec4 uBX[6];
+uniform vec3 uLPos; uniform vec3 uLCol;
+out vec4 o;
+vec3 rocky(vec3 n,vec3 L,float seed,bool moon){
+ float f=fbm(n*4.+seed,5); vec3 alb;
+ if(moon){vec3 g=n*6.;vec3 id=floor(g),fr=fract(g)-.5;vec3 cc=(h33(id+seed)-.5)*.4;float d=length(fr-cc),rad=.12+.22*h13(id+seed);
+  float cr=smoothstep(rad,rad*.6,d)*.35-smoothstep(rad*1.2,rad,d)*smoothstep(rad*.8,rad,d)*.2;
+  alb=vec3(.52,.51,.5)*(.55+.6*f)*(1.-cr);}
+ else alb=mix(vec3(.4,.26,.18),vec3(.72,.58,.44),f)*(.55+.45*fbm(n*12.+seed,3));
+ return alb*max(dot(n,L),0.)*uLCol+alb*.003;
+}
+vec3 giant(vec3 n,vec3 L,vec3 ax,float seed){
+ float lat=dot(n,ax); float w=fbm(n*3.+seed,4);
+ float bands=sin(lat*16.+w*5.+fbm(n*9.,3)*2.);
+ vec3 alb=mix(vec3(.86,.72,.54),vec3(.58,.38,.26),.5+.5*bands);
+ alb=mix(alb,vec3(.95,.9,.82),smoothstep(.62,.8,fbm(n*6.+uTime*.01,3))*.35);
+ float dl=dot(n,L); return alb*smoothstep(-.08,.35,dl)*max(dl+.08,0.)*uLCol;
+}
+mat2 r2m(float a){float c=cos(a),s=sin(a);return mat2(c,s,-s,c);}
+vec3 earth(vec3 n,vec3 hp,vec3 L,vec3 rd,int k){
+ float land=smoothstep(.49,.53,fbm(n*2.2+uBT[k].y,6));
+ float cl=smoothstep(.52,.72,fbm(n*4.+vec3(uTime*.004,0,0)+uBT[k].y+3.,5));
+ vec3 alb=mix(vec3(.02,.05,.13),mix(vec3(.1,.22,.07),vec3(.42,.36,.24),fbm(n*6.,3)),land);
+ alb=mix(alb,vec3(.85),cl*.8);
+ float dl=dot(n,L); vec3 c=alb*max(dl,0.)*uLCol;
+ float night=1.-smoothstep(-.12,.06,dl);
+ // regional lights
+ float reg=land*smoothstep(.55,.72,fbm(n*14.+uBT[k].y,4))*pow(fbm(n*90.,3),5.)*4.;
+ // city detail, computed camera-relative so it stays precise at street scale
+ vec3 lc=(hp-uBX[k].xyz)*uBX[k].w;
+ vec3 t1=normalize(cross(n,vec3(0,1,0))),t2=cross(n,t1); vec2 q=vec2(dot(lc,t1),dot(lc,t2));
+ float px=2.*uTan/uRes.y*length(hp)*uBX[k].w; float lod=1.-smoothstep(.3,1.2,px);
+ float blob=smoothstep(.35,.75,fbm(vec3(q*.012,2.),4));
+ float dens=exp(-length(q)*.03)*(.35+.65*blob)+blob*.25*smoothstep(.62,.8,fbm(vec3(q*.004,9.),3));
+ vec2 g=q*r2m(n3(vec3(q*.004,5.))*1.5)+vec2(n3(vec3(q*.03,3.)),n3(vec3(q*.03,7.)))*9.;
+ float sw=min(abs(fract(g.x)-.5),abs(fract(g.y)-.5)); float street=smoothstep(.05,.0,sw)*step(.45,h13(vec3(floor(g),4.)));
+ vec2 gh=g*.08; float hwy=smoothstep(.03,.0,min(abs(fract(gh.x)-.5),abs(fract(gh.y)-.5)))*step(.5,h13(vec3(floor(gh),6.)));
+ float bld=step(.86,h13(vec3(floor(g*4.),7.)))*(.75+.25*sin(uTime*2.+h13(vec3(floor(g*4.),2.))*40.));
+ float city=dens*dens*(street*.25+hwy*1.1+bld*1.3)*lod + dens*dens*.35*(1.-lod);
+ c+=vec3(1.,.6,.24)*(reg+city*uBT[k].z)*night*(1.-cl*.7);
+ float mu=max(dot(n,-rd),0.); c+=vec3(.25,.5,1.)*pow(1.-mu,4.)*smoothstep(-.3,.4,dl)*.6*length(uLCol);
+ return c;
+}
+void main(){
+ vec3 rd=camRay(gl_FragCoord.xy); float px=2.*uTan/uRes.y;
+ float tb=1e30; int kb=-1;
+ for(int k=0;k<6;k++){ if(k>=uNB)break; float R=uBP[k].w; float dc=length(uBP[k].xyz);
+  vec2 h=isph(vec3(0),rd,uBP[k].xyz,R+px*dc); if(h.x>0.&&h.x<tb){tb=h.x;kb=k;} }
+ vec3 col=vec3(0),add=vec3(0); float cov=0.;
+ for(int k=0;k<6;k++){ if(k>=uNB)break; int ty=int(uBT[k].x+.5); vec3 c=uBP[k].xyz; float R=uBP[k].w;
+  float tc=dot(c,rd); if(tc<=0.)continue; float d=length(c-rd*tc); bool occ=kb>=0&&kb!=k&&tb<tc;
+  if(ty==3&&!occ){vec3 bc=bb(uBT[k].z);add+=bc*uBT[k].w*(R*R/(d*d+R*R*.05)*.05*uBX[k].x+exp(-max(d-R,0.)/(R*.2))*.25*step(R,d));}
+  if(ty==4){ if(!occ)add+=vec3(.7,.8,1.)*uBT[k].z*.05*R*R/(d*d+R*R*.1);
+   vec3 s=normalize(uBX[k].xyz); vec3 e1=normalize(cross(s,vec3(.3,.1,1.))),e2=cross(s,e1); float a=uTime*uBT[k].w;
+   vec3 m=normalize(s*cos(.55)+(e1*cos(a)+e2*sin(a))*sin(.55));
+   vec3 w0=-c; float b=dot(rd,m), dd=dot(rd,w0), e=dot(m,w0), den=max(1.-b*b,1e-5);
+   float tr=(b*e-dd)/den, sl=(e-b*dd)/den;
+   if(tr>0.&&!(kb>=0&&tb<tr)){ float dist=length(w0+tr*rd-sl*m); float wd=R*1.5+abs(sl)*.035;
+    float face=pow(max(abs(b),0.),60.);
+    add+=vec3(.55,.7,1.)*uBT[k].z*(exp(-dist*dist/(wd*wd))*exp(-abs(sl)/uBX[k].w)*(.4+R/wd)+face*.3*exp(-d/(R*30.)));}}
+  if((ty==5||ty==1)&&d>R&&d<R*1.08){vec3 L=normalize(uLPos-c);float lit=clamp(dot(normalize(rd*tc-c),L)*.6+.5,0.,1.);
+   add+=vec3(.3,.55,1.)*exp(-(d-R)/(R*.014))*lit*(ty==5?.5:.15)*length(uLCol);}
+ }
+ if(kb>=0){ int k=kb; int ty=int(uBT[k].x+.5); vec3 c=uBP[k].xyz; float R=uBP[k].w;
+  float tc=dot(c,rd); float dcl=length(c-rd*tc); cov=clamp((R-dcl)/(px*tb)+.5,0.,1.);
+  vec2 h=isph(vec3(0),rd,c,R); float th=h.x>0.?h.x:tc; vec3 hp=rd*th; vec3 n=normalize(hp-c); vec3 L=normalize(uLPos-hp);
+  if(ty==0)col=rocky(n,L,uBT[k].y,false);
+  else if(ty==2)col=rocky(n,L,uBT[k].y,true);
+  else if(ty==1)col=giant(n,L,normalize(uBX[k].xyz),uBT[k].y);
+  else if(ty==3){float mu=max(dot(n,-rd),0.);float g=fbm(n*9.+vec3(0,uTime*.12,0)+uBT[k].y,5);
+   float sp=smoothstep(.5,.72,fbm(n*2.5+uTime*.06,4))*uBX[k].y;
+   col=bb(uBT[k].z*(.9+.2*g))*uBT[k].w*(.3+.7*pow(mu,.45))*(.65+.7*g)*(1.-.55*sp);}
+  else if(ty==4)col=vec3(.8,.9,1.)*uBT[k].z*2.;
+  else col=earth(n,hp,L,rd,k);
+ }
+ vec4 P=vec4(col*cov,cov);
+ for(int k=0;k<6;k++){ if(k>=uNB)break; if(int(uBT[k].x+.5)!=1||uBX[k].w<.5)continue;
+  vec3 c=uBP[k].xyz; float R=uBP[k].w; vec3 nr=normalize(uBX[k].xyz); float dn=dot(rd,nr); if(abs(dn)<1e-5)continue;
+  float tr=dot(c,nr)/dn; if(tr<=0.)continue; vec3 hp=rd*tr; float rr=length(hp-c)/R; if(rr<1.45||rr>2.35)continue;
+  float dens=(.5+.5*sin(rr*38.+sin(rr*9.)*2.))*smoothstep(1.45,1.55,rr)*smoothstep(2.35,2.2,rr)*(.4+.6*h13(vec3(floor(rr*70.))));
+  vec3 L=normalize(uLPos-hp); float sh=isph(hp,L,c,R).x>0.?.04:1.;
+  vec3 rc=vec3(.85,.78,.66)*(abs(dot(nr,L))*.8+.08)*sh*uLCol; float ra=dens*.75;
+  vec4 Rg=vec4(rc*ra,ra);
+  P=(kb==k&&tb<tr)?P+Rg*(1.-P.a):Rg+P*(1.-ra);
+ }
+ o=vec4(P.rgb+add,P.a);
+}`;
+
+// ------------------------------------------------------------ volumetric gas (half resolution)
+const VOL_FS = `#version 300 es
+${COMMON}
+uniform vec4 uVC; uniform int uVM; uniform vec4 uVP; uniform vec3 uVA,uVB; uniform float uVBr;
+uniform vec4 uL[4]; uniform vec3 uLC[4];
+out vec4 o;
+float dens(vec3 p,out vec3 em){
+ em=vec3(0); float r=length(p); if(r>1.)return 0.;
+ if(uVM==0){ vec3 q=p*2.3+vec3(0.,0.,uTime*.008); float w=fbm(q*.9+uVP.w,3); float n=fbm(q+w*1.8,4);
+  float d=smoothstep(.45,.82,n)*smoothstep(1.,.35,r); float m=fbm(q*.6+3.,2);
+  em=mix(uVA,uVB,smoothstep(.38,.62,m))*d*d*uVP.x;
+  float dust=smoothstep(.56,.7,fbm(q*1.7+7.,3))*smoothstep(1.,.5,r); return d*.5+dust*1.6; }
+ if(uVM==1){ float R=uVP.z; vec3 dir=p/max(r,1e-4); float fil=fbm(dir*3.5+uVP.w,4), fil2=fbm(p*6.+uVP.w,3);
+  float sh=exp(-pow((r-R*(.8+.32*fil))/(.05+.09*R),2.)); float d=sh*(.3+fil2*1.3);
+  float inner=exp(-r*r/(R*R*.1+.002))*uVP.x;
+  em=mix(uVA,uVB,smoothstep(.42,.62,fil))*d*1.4+vec3(1.,.9,.8)*inner*2.+vec3(1.,.75,.45)*sh*uVP.x*.6; return d; }
+ vec3 q=p*3.2+vec3(uTime*.006,0.,0.); float w=fbm(q*.8,3); float n=fbm(q*1.1+w*2.,5);
+ float d=smoothstep(.45,.8,n)*smoothstep(1.,.55,r);
+ em=uVA*d*d*uVP.x*.25+uVB*n*n*n*n*.03; return d;
+}
+void main(){
+ vec3 rd=camRay(gl_FragCoord.xy); vec2 tt=isph(vec3(0),rd,uVC.xyz,uVC.w);
+ if(tt.y<0.){o=vec4(0);return;}
+ float t0=max(tt.x,0.),t1=tt.y; const int N=42; float dt=(t1-t0)/float(N);
+ float t=t0+dt*h13(vec3(gl_FragCoord.xy,1.)); vec3 acc=vec3(0); float Tr=1.; float R=uVC.w; float dtn=dt/R;
+ for(int i=0;i<N;i++){
+  vec3 pw=rd*t; vec3 em; float d=dens((pw-uVC.xyz)/R,em);
+  if(d>.001||em.r+em.g+em.b>0.){
+   vec3 li=vec3(0); for(int j=0;j<4;j++){ if(uL[j].w<=0.)continue; vec3 dl=uL[j].xyz-pw; li+=uLC[j]*uL[j].w/(1.+dot(dl,dl)/(R*R)*260.); }
+   acc+=Tr*(em+li*d*(uVM==2?vec3(1.,.5,.32):vec3(1.)))*dtn*uVBr; Tr*=exp(-d*dtn*uVP.y*7.);
+   if(Tr<.02)break; }
+  t+=dt;
+ }
+ o=vec4(acc,1.-Tr);
+}`;
+
+// ------------------------------------------------------------ GPU particles: positions are pure functions of (id, time)
+const PART_VS = `#version 300 es
+${COMMON}
+uniform int uMode; uniform uint uSeed;
+uniform vec3 uO; uniform mat3 uM; uniform float uScale;
+uniform vec4 uP0,uP1,uP2,uP3;
+uniform float uBright,uRef,uPxMin,uMaxPx,uNear;
+uniform vec4 uHide; uniform vec4 uProto[24];
+out vec3 vCol; flat out float vShape; out vec2 vL;
+uint bid;
+float R(uint k){return hf(bid+k*0x9E3779B9u);}
+float gs(uint k){return sqrt(-2.*log(max(R(k),1e-7)))*cos(6.2831853*R(k+1u));}
+vec3 g3(uint k){return vec3(gs(k),gs(k+2u),gs(k+4u));}
+vec3 sph(float a,float b){float z=2.*a-1.,r=sqrt(max(0.,1.-z*z)),p=6.2831853*b;return vec3(r*cos(p),z,r*sin(p));}
+mat2 r2(float a){float c=cos(a),s=sin(a);return mat2(c,s,-s,c);}
+void bas(vec3 n,out vec3 e1,out vec3 e2){e1=normalize(cross(n,abs(n.y)<.95?vec3(0,1,0):vec3(1,0,0)));e2=cross(n,e1);}
+void main(){
+ bid=hu(uint(gl_VertexID)*0x27d4eb2du^(uSeed*0x165667b1u));
+ vec3 p=vec3(0),col=vec3(1); float lum=1.,size=0.,shape=0.; float t=uTime;
+ if(uMode==0){ // local star field wrapped around the camera
+  float B=uP0.x; p=mod(vec3(R(1u),R(2u),R(3u))*B-uP1.xyz,B)-B*.5;
+  float rv=R(4u); float vis=clamp((uP0.y-rv)/(uP0.y*.2+1e-5),0.,1.);
+  col=bb(2800.+pow(R(5u),2.6)*26000.);
+  lum=(.25+pow(R(6u),14.)*60.)*vis*smoothstep(B*.5,B*.3,length(p))*(.85+.15*sin(t*(1.+R(7u)*3.)+R(8u)*40.));
+ } else if(uMode==1){ // galaxies
+  float ty=uP0.x; float tt=t*uP2.x;
+  if(ty<.5){ float arms=uP0.y,tw=uP0.z,bul=uP0.w; float u0=R(0u);
+   if(uP3.x>.5){ float r=.07+pow(R(1u),.8)*.95; float k=floor(R(2u)*arms);
+    float th=k*6.2831853/arms+tw*log(r)-.38+gs(3u)*.05+tt/(r+.08);
+    p=vec3(cos(th)*r,gs(5u)*.005,sin(th)*r); p.xz+=(vec2(R(7u),R(8u))-.5)*.035;
+    lum=.3*smoothstep(1.05,.25,r); size=.012+.02*R(9u); shape=2.;
+   } else if(u0<bul){ float r=.015+.2*pow(R(1u),2.2); p=sph(R(2u),R(3u))*r; p.y*=.6;
+    col=bb(3500.+R(4u)*2000.); lum=.6+R(5u);
+   } else { float r=min(-log(1.-R(1u)*.985)*.27,1.3); float inArm=step(R(2u),.72); float k=floor(R(3u)*arms);
+    float th=k*6.2831853/arms+tw*log(max(r,.02)); th+=gs(4u)*mix(.9,.24+.1*r,inArm)+tt/(r+.08);
+    float young=inArm*step(R(6u),.5);
+    p=vec3(cos(th)*r,gs(7u)*uP2.y*mix(1.,.35,young)*(1.+r),sin(th)*r); p.xz+=vec2(gs(9u),gs(11u))*.012;
+    col=bb(young>.5?7000.+R(13u)*20000.:3000.+pow(R(13u),2.)*5000.);
+    lum=young>.5?1.5+pow(R(14u),6.)*10.:.5+pow(R(14u),8.)*6.;
+    if(young>.5&&R(15u)<.03){col=vec3(1.,.35,.55);size=.01+.02*R(16u);lum=2.5;}
+   }
+  } else if(ty<1.5){ float s=sqrt(R(1u))*.97; float r=min(.22*s/(1.-s),2.);
+   p=sph(R(2u),R(3u))*r*vec3(1.,.62,.8); p.xz=r2(tt*.6/(r+.1))*p.xz;
+   col=bb(3200.+R(4u)*2200.); lum=.7+pow(R(5u),8.)*5.;
+  } else { float c=floor(R(1u)*7.); vec3 cen=(h33(vec3(c,uP0.y,3.))-.5)*vec3(1.2,.3,1.2);
+   p=cen+g3(2u)*(.08+.1*h13(vec3(c,5.,1.))); p.xz=r2(tt*.5/(length(p)+.2))*p.xz;
+   col=R(8u)<.1?vec3(1.,.4,.6):bb(6000.+R(9u)*18000.); lum=.8+pow(R(10u),6.)*8.;
+  }
+  if(uP1.w>0.){ vec3 e=normalize(uP1.xyz); float r=length(p.xz); float f=uP1.w*smoothstep(.2,1.1,r); float al=dot(p,e);
+   p+=e*al*f*1.6; p.xz=r2(f*1.3*sign(al+1e-4))*p.xz; p.y+=f*.18*al;
+   if(R(20u)<.08*uP1.w){float s=R(21u); vec3 b=uP1.xyz*s+vec3(0,sin(s*3.14159)*.3,0)+g3(22u)*.05; p=mix(p,b,.9);}
+  }
+ } else if(uMode==2){ // asteroid belt
+  float r=mix(uP0.x,uP0.y,sqrt(R(1u))); float th=R(2u)*6.2831853+uP0.w*t*pow(r,-1.5);
+  p=vec3(cos(th)*r,gs(3u)*uP0.z,sin(th)*r); col=mix(vec3(.55,.5,.45),vec3(.8,.7,.6),R(5u));
+  float big=pow(R(6u),12.); size=uP1.x*(.15+big*3.); lum=uP1.y*(.3+big*4.); shape=1.;
+ } else if(uMode==3){ // comet
+  float age=pow(R(1u),1.5)*uP0.w; vec3 nuc=uP0.xyz,vel=uP1.xyz; vec3 e=nuc-vel*age; vec3 a=normalize(e); float k=R(2u);
+  if(k<.12){p=nuc+g3(3u)*uP2.x;col=vec3(.9,.95,1.);lum=2.;size=uP2.x*.5;}
+  else if(k<.55){p=e+a*age*uP1.w*1.6+g3(3u)*age*uP2.y*.25;col=vec3(.45,.65,1.);lum=1.2*exp(-age/uP0.w*2.5);size=uP2.x*(.3+age*.4);}
+  else{p=e+vel*age*.85+a*age*uP1.w*.5+g3(3u)*age*uP2.y;col=vec3(1.,.85,.62);lum=exp(-age/uP0.w*2.);size=uP2.x*(.4+age*.6);}
+ } else if(uMode==4){ // matter around a black hole + tidal disruption stream
+  float u=uP3.x>.5?.72+.28*R(1u):R(1u); float spd=uP0.z;
+  if(u<.55){ float r=mix(uP0.x,uP0.y,pow(R(2u),1.6)); float th=R(3u)*6.2831853+spd*.7071*pow(r,-1.5)*t;
+   p=vec3(cos(th)*r,gs(4u)*.06*r,sin(th)*r); col=bb(18000.*pow(r/uP0.x,-.75)); lum=(.4+R(6u))*pow(uP0.x/r,1.2)*.35; size=.015*r;
+  } else if(u<.72){ float r=mix(uP0.y*.8,uP0.y*3.,R(2u)); float th=R(3u)*6.2831853+spd*.7071*pow(r,-1.5)*t;
+   vec3 ax=sph(R(4u),R(5u)),e1,e2; bas(ax,e1,e2); p=(e1*cos(th)+e2*sin(th))*r;
+   col=bb(3000.+pow(R(6u),2.)*20000.); lum=.5+pow(R(7u),8.)*20.;
+  } else { float st=uP2.z,dur=uP2.y,r0=uP2.x; float el=t-st; if(el<=0.)lum=0.; else {
+   float tau=st+R(2u)*min(el,dur); float x=clamp((tau-st)/dur,0.,1.);
+   float rs=1.+(r0-1.)*sqrt(1.-x); float w0=spd*.7071*pow(r0,-1.5); float ths=w0*dur*4.*(1.-pow(1.-x,.25));
+   float rrel=rs*(1.+(R(3u)-.5)*.3); float dtp=t-tau; float r=rrel*exp(-dtp*.09*r0/rrel);
+   float th=ths+spd*.7071*pow(max(.5*(rrel+r),1.2),-1.5)*dtp+(R(4u)-.5)*.04;
+   p=vec3(cos(th)*r,gs(5u)*.02*r,sin(th)*r); float heat=clamp(3./r,0.,3.);
+   col=bb(5000.+heat*9000.); lum=uP2.w*(.5+heat)*smoothstep(1.4,2.2,r)*smoothstep(0.,.3,dtp+.05); } }
+ } else if(uMode==5){ // binary black hole: two disks, bridge stream, circumbinary spiral
+  vec3 A=uP0.xyz,B=uP1.xyz; float sep=max(uP3.x,.001),ph=uP2.x,mg=uP2.y; float u=R(1u);
+  if(u<.6){ bool f=u<.3; vec3 C=f?A:B; float rr=mix(mix(2.4,max(2.8,.42*sep),pow(R(2u),1.3)),mix(2.6,15.,pow(R(2u),1.3)),mg);
+   vec3 cc=mix(C,vec3(0),mg); vec3 n=normalize(mix(f?vec3(.15,1.,0.):vec3(-.1,1.,.12),vec3(0,1,0),mg)),e1,e2; bas(n,e1,e2);
+   float th=R(3u)*6.2831853+2.5*pow(rr,-1.5)*t+ph*.4;
+   p=cc+(e1*cos(th)+e2*sin(th))*rr+n*gs(4u)*.03*rr; col=bb(22000.*pow(rr/2.4,-.75)); lum=1.2*pow(2.4/rr,1.1);
+  } else if(u<.75){ float s=fract(R(2u)+t*.35); vec3 mid=(A+B)*.5; vec3 pr=normalize(cross(B-A+1e-4,vec3(0,1,0)))*sep*.35;
+   bool ab=R(3u)<.5; vec3 P0=ab?A:B,P2=ab?B:A,P1=mid+(ab?pr:-pr); p=mix(mix(P0,P1,s),mix(P1,P2,s),s)+g3(4u)*(.3+sep*.03);
+   col=bb(9000.); lum=.9*(1.-mg)*sin(3.14159*s);
+  } else { float r=mix(1.3,3.2,R(2u))*26.; bool arm=R(4u)<.6;
+   float th=arm?ph+floor(R(5u)*2.)*3.14159+1.8*log(r/26.)+gs(6u)*.22:R(3u)*6.2831853; th+=.25*t*pow(r/26.,-1.5);
+   p=vec3(cos(th)*r,gs(8u)*.5,sin(th)*r);
+   if(uP2.w>0.){float dr=length(p.xz)-uP2.z; float wv=exp(-dr*dr*.004)*sin(dr*.35)*uP2.w; p.xz*=1.+wv*.06; p.y+=wv*2.; lum=1.+abs(wv)*3.;}
+   col=bb(6000.+R(10u)*14000.); lum*=.4+pow(R(11u),10.)*20.;
+  }
+ } else if(uMode==6){ // supernova: outflowing dust (P1.y=1) / debris
+  float tp=uP0.x; vec3 d=sph(R(2u),R(3u));
+  if(uP1.y>.5){ float r0=1.15+fract(R(1u)+t*.03)*2.8; float r=max(r0,uP1.x*(1.+.06*R(4u)));
+   p=d*r; col=r>r0?vec3(1.,.7,.45):vec3(1.,.5,.3); lum=.25*smoothstep(4.,1.3,r0)*(r>r0?3.*exp(-tp/5.):1.); size=.05;
+  } else { if(tp<=0.)lum=0.; else {
+   d=normalize(d+(h33(floor(d*4.)+uP0.w)-.5)*.55); float v=.3+.7*pow(R(4u),.6);
+   float Rm=uP0.y*(1.-exp(-tp/4.5))+tp*.1; p=d*v*Rm; float k=R(5u);
+   vec3 pc=k<.2?vec3(1.,.75,.3):k<.4?vec3(.3,1.,.55):k<.55?vec3(.7,.35,1.):k<.75?vec3(.35,.8,1.):vec3(1.,.35,.25);
+   col=mix(pc,vec3(1.,.95,.9),exp(-tp/1.5)); lum=(.4+pow(R(6u),6.)*8.)*(exp(-tp/5.)*2.+.25)*uP0.z; size=.03+v*Rm*.008; } }
+ } else if(uMode==7){ // protostars: collapsing envelopes, flattened accretion disks
+  int k=gl_VertexID%24; vec4 S=uProto[k]; float kk=float(k); float on=smoothstep(S.w,S.w+2.5,t);
+  vec3 ax=normalize(h33(vec3(kk,3.,7.))-.5+vec3(0,.6,0)),e1,e2; bas(ax,e1,e2);
+  if(gl_VertexID<24){p=S.xyz;col=bb(mix(2500.,8000.,on));lum=mix(.5,40.,on);size=.02;}
+  else{ float ph=fract(R(1u)+t*.07*(.6+R(2u)*.8)); float r=mix(1.3,.03,pow(ph,.8))*(.6+.4*h13(vec3(kk,1.,1.)));
+   float th=R(3u)*6.2831853+1.4/(r+.04)+t*.3/(r+.1); float fl=smoothstep(.1,.9,r);
+   vec3 ring=e1*cos(th)+e2*sin(th); vec3 dk=ring*r+ax*gs(4u)*.02*r; vec3 sp=normalize(mix(sph(R(6u),R(7u)),ring,.5))*r;
+   p=S.xyz+mix(dk,sp,fl); float heat=smoothstep(.5,.02,r);
+   col=mix(vec3(.8,.35,.2),bb(4000.+4000.*on),heat); lum=(.08+heat*1.2)*(.4+on*1.2); size=.03*r+.01; }
+ } else if(uMode==8){ // cosmic web
+  float N=uP0.x; vec3 cell=floor(vec3(R(1u),R(2u),R(3u))*N);
+  vec3 na=cell+(h33(cell*1.3+.7)-.5)*.9; vec3 org=uP1.xyz+(h33(uP1.xyz*1.3+.7)-.5)*.9; float rich=h13(cell+2.1);
+  if(R(4u)<.2){p=na+g3(5u)*(.02+.05*rich)*(R(11u)<.3?2.5:1.);col=mix(vec3(1.,.8,.55),vec3(1.,.95,.85),R(12u));lum=(.5+rich*1.5);}
+  else{ int a=int(R(5u)*3.); vec3 of=a==0?vec3(1,0,0):a==1?vec3(0,1,0):vec3(0,0,1); vec3 cb=cell+of; vec3 nb=cb+(h33(cb*1.3+.7)-.5)*.9;
+   float keep=step(.28,h13(cell*2.+of*5.)); float f=fract(R(6u)+t*uP0.z); float sp=mix(.5-.5*f,.5+.5*f,step(.5,R(7u)));
+   vec3 bd=(h33(cell+of*3.)-.5)*.7; p=mix(na,nb,sp)+bd*sin(3.14159*sp)+(h33(cell+of*9.)-.5)*.25*sin(6.2832*sp)+g3(8u)*uP0.y*(R(14u)<.25?3.:1.);
+   col=mix(vec3(.45,.55,1.),vec3(.8,.5,1.),R(15u)); lum=keep*1.1+(1.-keep)*.05; }
+  p-=org;
+ } else if(uMode==9){ // galaxy cluster: every point is a galaxy
+  float u=R(1u); float r=.05+.8*pow(R(2u),1.8); vec3 d=sph(R(3u),R(4u)); p=d*r*vec3(1.,.8,.9);
+  if(u<.02){p*=.12;lum=12.;size=.02;col=vec3(1.,.85,.65);}
+  else if(u>.93){p*=.6;size=.15;lum=.4;col=vec3(1.,.85,.7)*.6;}
+  else{lum=.6+pow(R(5u),6.)*6.;size=.006+.01*R(6u);col=R(7u)<.6?vec3(1.,.82,.6):vec3(.7,.8,1.);}
+ } else if(uMode==10){ // dust threaded on magnetic field lines
+  float k=floor(R(1u)*uP0.x); vec3 hk=h33(vec3(k,1.3,7.7)); vec3 c=(hk-.5)*uP0.w;
+  vec3 ax=normalize(h33(vec3(k,5.1,2.3))-.5),e1,e2; bas(ax,e1,e2);
+  float s=fract(R(2u)+t*uP1.x)-.5; float L=uP0.y*(.5+hk.x); float ph=s*12.+k;
+  p=c+ax*s*L+(e1*cos(ph)+e2*sin(ph))*uP0.z*(.5+hk.y)+g3(3u)*uP0.z*.25+e1*sin(s*3.+k)*L*.15;
+  col=mix(vec3(1.,.5,.35),vec3(.6,.5,1.),hk.z); lum=.3*(1.-4.*s*s); size=uP0.z*.4;
+ } else { // dense star cluster (Plummer sphere)
+  float u=max(R(1u),1e-4); float r=min(uP0.x/sqrt(pow(u,-2./3.)-1.),uP0.x*8.);
+  p=sph(R(2u),R(3u))*r; p.xz=r2(t*.05/(r/uP0.x+.5))*p.xz;
+  col=bb(R(4u)<.08?15000.+R(5u)*10000.:3200.+pow(R(5u),2.)*3000.); lum=.5+pow(R(6u),10.)*25.;
+ }
+ vec3 w=uO+uM*p; float vz=dot(w,uCamF);
+ if(vz<uNear||lum<=0.){gl_Position=vec4(2.,2.,2.,1.);gl_PointSize=0.;return;}
+ float vx=dot(w,uCamR),vy=dot(w,uCamU); float asp=uRes.x/uRes.y;
+ if(abs(vx)>vz*uTan*asp*1.1||abs(vy)>vz*uTan*1.1){gl_Position=vec4(2.,2.,2.,1.);gl_PointSize=0.;return;}
+ if(uHide.w>0.){float cz=dot(uHide.xyz,uCamF);if(vz>cz&&cz>0.){vec2 a=vec2(vx,vy)*(cz/vz)-vec2(dot(uHide.xyz,uCamR),dot(uHide.xyz,uCamU));
+  if(length(a)<uHide.w){gl_Position=vec4(2.,2.,2.,1.);gl_PointSize=0.;return;}}}
+ gl_Position=vec4(vx/(uTan*asp),vy/uTan,0.,vz);
+ float pxs=size*uScale/(vz*uTan)*uRes.y*.5; float ps=clamp(pxs,uPxMin,uMaxPx);
+ float I=lum*uBright*uRef*uRef/(vz*vz+uRef*uRef);
+ vCol=shape>1.5?vec3(clamp(lum*uBright,0.,1.)):col*I*(uPxMin*uPxMin)/(ps*ps);
+ gl_PointSize=ps; vShape=shape; vL=vec2(0);
+ if(shape>.5&&shape<1.5){vec3 Lw=uO-w;vL=normalize(vec2(dot(Lw,uCamR),dot(Lw,uCamU))+1e-6);}
+}`;
+const PART_FS = `#version 300 es
+precision highp float;
+in vec3 vCol; flat in float vShape; in vec2 vL; out vec4 o;
+void main(){vec2 q=gl_PointCoord*2.-1.;q.y=-q.y;float r2=dot(q,q);if(r2>1.)discard;float a=exp(-r2*4.);
+ if(vShape>.5&&vShape<1.5){vec3 n=vec3(q,sqrt(1.-r2));a=smoothstep(1.,.8,r2)*(max(dot(n,normalize(vec3(vL,.4))),0.)+.03)*1.6;}
+ o=vec4(vCol*a,0.);}`;
+
+// ------------------------------------------------------------ glare sprites for individual luminous objects
+const SPR_VS = `#version 300 es
+${COMMON}
+layout(location=0) in vec4 aP; layout(location=1) in vec4 aC; layout(location=2) in vec4 aX;
+uniform float uNear;
+out vec2 vP; out float vCore,vHalf; out vec4 vC; out vec2 vX;
+void main(){int id=gl_VertexID;vec2 c=vec2((id==1||id==2||id==4)?1.:-1.,(id==2||id==4||id==5)?1.:-1.);
+ vec3 w=aP.xyz;float vz=dot(w,uCamF);if(vz<uNear){gl_Position=vec4(2,2,2,1);return;}
+ vec2 ndc=vec2(dot(w,uCamR)/(uRes.x/uRes.y),dot(w,uCamU))/(vz*uTan);
+ float core=max(aP.w/(vz*uTan)*uRes.y*.5,1.);
+ float hs=core*3.+clamp(sqrt(aC.w)*14.*aX.y,0.,uRes.y*.6);
+ vP=c*hs;vCore=core;vHalf=hs;vC=aC;vX=aX.xy;gl_Position=vec4(ndc+c*hs/(uRes*.5),0.,1.);}`;
+const SPR_FS = `#version 300 es
+precision highp float;
+in vec2 vP; in float vCore,vHalf; in vec4 vC; in vec2 vX; out vec4 o;
+void main(){float r=length(vP),c=vCore;float core=exp(-r*r/(c*c));float halo=c*c/(c*c+r*r*.15)*.08*vX.y;
+ float sp=0.;if(vX.x>0.){vec2 a=abs(vP);sp=(exp(-a.y/(1.+c*.15))*exp(-a.x/(vHalf*.35))+exp(-a.x/(1.+c*.15))*exp(-a.y/(vHalf*.35)))*.25*vX.x;}
+ o=vec4(vC.rgb*vC.w*(core+halo+sp)*smoothstep(vHalf,vHalf*.6,r),0.);}`;
+
+// ------------------------------------------------------------ post: temporal blur, bloom pyramid, tone mapping
+const BLIT_FS = `#version 300 es
+precision highp float; uniform sampler2D uT; uniform vec2 uInv; out vec4 o;
+void main(){o=texture(uT,gl_FragCoord.xy*uInv);}`;
+const ACC_FS = `#version 300 es
+precision highp float; uniform sampler2D uCur,uPrev; uniform float uTrail; uniform vec2 uInv; out vec4 o;
+void main(){vec2 uv=gl_FragCoord.xy*uInv;o=vec4(mix(texture(uCur,uv).rgb,texture(uPrev,uv).rgb,uTrail),1.);}`;
+const DOWN_FS = `#version 300 es
+precision highp float; uniform sampler2D uT; uniform vec2 uInv,uSrc; out vec4 o;
+void main(){vec2 uv=gl_FragCoord.xy*uInv;vec2 d=uSrc;
+ vec3 c=texture(uT,uv+vec2(-d.x,-d.y)).rgb+texture(uT,uv+vec2(d.x,-d.y)).rgb+texture(uT,uv+vec2(-d.x,d.y)).rgb+texture(uT,uv+d).rgb;
+ o=vec4(min(c*.25,vec3(6e4)),1.);}`;
+const UP_FS = `#version 300 es
+precision highp float; uniform sampler2D uT,uLow; uniform vec2 uInv,uSrc; out vec4 o;
+void main(){vec2 uv=gl_FragCoord.xy*uInv;vec2 d=uSrc;
+ vec3 b=texture(uLow,uv).rgb*4.+(texture(uLow,uv+vec2(d.x,0)).rgb+texture(uLow,uv-vec2(d.x,0)).rgb+texture(uLow,uv+vec2(0,d.y)).rgb+texture(uLow,uv-vec2(0,d.y)).rgb)*2.
+  +texture(uLow,uv+d).rgb+texture(uLow,uv-d).rgb+texture(uLow,uv+vec2(d.x,-d.y)).rgb+texture(uLow,uv+vec2(-d.x,d.y)).rgb;
+ o=vec4(texture(uT,uv).rgb+b/16.,1.);}`;
+const FINAL_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uImg,uBloom; uniform vec2 uRes; uniform float uExp,uBloomAmt,uFade,uFlash,uTime; uniform vec4 uRipS; uniform vec3 uFlashCol;
+out vec4 o;
+float h(vec2 p){vec3 p3=fract(vec3(p.xyx)*.1031);p3+=dot(p3,p3.yzx+33.33);return fract((p3.x+p3.y)*p3.z);}
+vec3 aces(vec3 x){return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14),0.,1.);}
+void main(){vec2 uv=gl_FragCoord.xy/uRes;
+ if(uRipS.w>0.){vec2 d=uv-uRipS.xy;vec2 da=vec2(d.x*(uRes.x/uRes.y),d.y);float r=length(da),x=r-uRipS.z;uv+=d/max(r,1e-4)*exp(-x*x*260.)*sin(x*110.)*uRipS.w*.02;}
+ vec2 d=uv-.5; float ca=.0025*dot(d,d)*4.;
+ vec3 c=vec3(texture(uImg,uv+d*ca).r,texture(uImg,uv).g,texture(uImg,uv-d*ca).b);
+ c+=texture(uBloom,uv).rgb*uBloomAmt;
+ c=c*uExp+uFlashCol*uFlash;
+ c=aces(c); c=pow(c,vec3(1./2.2));
+ c*=mix(.62,1.,smoothstep(1.35,.35,length(vec2(d.x*(uRes.x/uRes.y),d.y)*2.)));
+ c+=(h(gl_FragCoord.xy+fract(uTime*7.)*391.)-.5)*.012;
+ o=vec4(max(c,0.)*uFade,1.);}`;
+
+// ============================================================ math (double precision, camera-relative)
+const TAU = Math.PI * 2;
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const sm = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const mix = (a, b, t) => a + (b - a) * t;
+const bump = (t, c, w) => Math.exp(-(((t - c) / w) ** 2));
+const vis = (L, a, b, c, d) => sm(a, b, L) * (1 - sm(c, d, L));
+const V = {
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s], dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  len: a => Math.hypot(a[0], a[1], a[2]), norm: a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+  lerp: (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t],
+};
+const modp = (x, B) => ((x % B) + B) % B;
+// time-aware cubic Hermite spline through [t, vec] keys (C1 continuous velocity)
+function spline(K, t) {
+  const n = K.length;
+  if (t <= K[0][0]) return K[0][1].slice(); if (t >= K[n - 1][0]) return K[n - 1][1].slice();
+  let i = 0; while (t > K[i + 1][0]) i++;
+  const h = K[i + 1][0] - K[i][0], s = (t - K[i][0]) / h;
+  const tan = j => { const a = K[Math.max(0, j - 1)], b = K[Math.min(n - 1, j + 1)]; return a[1].map((v, k) => (b[1][k] - v) / (b[0] - a[0])); };
+  const m0 = tan(i), m1 = tan(i + 1), s2 = s * s, s3 = s2 * s;
+  return K[i][1].map((v, k) => (2 * s3 - 3 * s2 + 1) * v + (s3 - 2 * s2 + s) * h * m0[k] + (-2 * s3 + 3 * s2) * K[i + 1][1][k] + (s3 - s2) * h * m1[k]);
+}
+// monotone cubic for scalar keys (no overshoot) — used for the logarithmic camera distance
+function mono(K, t) {
+  const n = K.length;
+  if (t <= K[0][0]) return K[0][1]; if (t >= K[n - 1][0]) return K[n - 1][1];
+  let i = 0; while (t > K[i + 1][0]) i++;
+  const sec = j => (K[j + 1][1] - K[j][1]) / (K[j + 1][0] - K[j][0]);
+  const tg = j => { if (j === 0) return sec(0); if (j === n - 1) return sec(n - 2); const a = sec(j - 1), b = sec(j); return a * b <= 0 ? 0 : 2 / (1 / a + 1 / b); };
+  const h = K[i + 1][0] - K[i][0], s = (t - K[i][0]) / h, s2 = s * s, s3 = s2 * s;
+  return (2 * s3 - 3 * s2 + 1) * K[i][1] + (s3 - 2 * s2 + s) * h * tg(i) + (-2 * s3 + 3 * s2) * K[i + 1][1] + (s3 - s2) * h * tg(i + 1);
+}
+function cam(p, tg, up, fov) {
+  const f = V.norm(V.sub(tg, p)), r = V.norm(V.cross(f, up)), u = V.cross(r, f);
+  return { p, f, r, u, tan: Math.tan(fov * Math.PI / 360) };
+}
+// orthonormal frame with y = n, scaled; column-major mat3
+function orient(n, s = 1) {
+  n = V.norm(n); const x = V.norm(V.cross(n, Math.abs(n[2]) < .9 ? [0, 0, 1] : [1, 0, 0])), z = V.cross(x, n);
+  const m = new Float32Array([x[0] * s, x[1] * s, x[2] * s, n[0] * s, n[1] * s, n[2] * s, z[0] * s, z[1] * s, z[2] * s]);
+  m.ax = [x, n, z]; m.s = s; return m;
+}
+const toLocal = (M, v) => [V.dot(M.ax[0], v) / M.s, V.dot(M.ax[1], v) / M.s, V.dot(M.ax[2], v) / M.s];
+const toWorld = (M, v) => V.add(V.add(V.mul(M.ax[0], v[0] * M.s), V.mul(M.ax[1], v[1] * M.s)), V.mul(M.ax[2], v[2] * M.s));
+const I3 = orient([0, 1, 0], 1);
+// sky orientation: q.x toward galactic core, q.y galactic pole (rows of the matrix)
+function skyMat(core, pole) {
+  pole = V.norm(pole); core = V.norm(V.sub(core, V.mul(pole, V.dot(core, pole)))); const z = V.cross(core, pole);
+  return new Float32Array([core[0], pole[0], z[0], core[1], pole[1], z[1], core[2], pole[2], z[2]]);
+}
+function bbJS(T) {
+  const x = clamp(Math.log2(T / 1000) / 5, 0, 1), L = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+  const a = [1, .28, .06], b = [1, .62, .32], c = [1, .93, .84], d = [.78, .86, 1], e = [.58, .7, 1];
+  if (x < .25) return L(a, b, x / .25); if (x < .45) return L(b, c, (x - .25) / .2); if (x < .6) return L(c, d, (x - .45) / .15); return L(d, e, (x - .6) / .4);
+}
+function rng(seed) { let s = seed >>> 0; return () => { s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+// ============================================================ frame description
+function newFrame(c) {
+  return { cam: c, bg: null, sky: null, bh: null, bodies: [], light: { p: [0, 0, 0], col: [0, 0, 0] }, vol: null, parts: [], sprites: [],
+    post: { exp: 1, trail: 0, bloom: .05, fade: 1, flash: 0, flashCol: [1, .95, .9], rip: [.5, .5, 0, 0] } };
+}
+function skySpec(o) {
+  return Object.assign({ A: [0, 0, 0, 0], B: [1, .25, 0, 0], rot: I3, grb: [0, 0, 1, 0], rip: [0, 0, 1, 0], ripR: 0, lens: [0, 0, 1, 0] }, o);
+}
+function PS(mode, count, o, opt = {}) {
+  return Object.assign({ M: I3, scale: 1, P0: [0, 0, 0, 0], P1: [0, 0, 0, 0], P2: [0, 0, 0, 0], P3: [0, 0, 0, 0], bright: 1, ref: 1e6,
+    pxMin: 1.6, near: 1e-4, blend: 0, seed: 1, hide: [0, 0, 0, 0] }, opt, { mode, count, o });
+}
+const relTo = c => p => V.sub(p, c.p);
+function sprite(F, p, size, col, I, spikes = 0, halo = 1) { if (I > 1e-4) F.sprites.push([p, size, col, I, spikes, halo]); }
+
+// ============================================================ GL
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance' });
+if (!gl) { document.body.innerHTML = '<p style="color:#888;font:14px sans-serif;text-align:center;margin-top:40vh">WebGL2 is required.</p>'; throw new Error('no webgl2'); }
+const HDR = !!gl.getExtension('EXT_color_buffer_float');
+const MAXPT = Math.min(gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1], 256);
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const log = gl.getShaderInfoLog(s); console.error(log, src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n')); throw new Error(log); }
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const cache = {}; p.u = n => n in cache ? cache[n] : (cache[n] = gl.getUniformLocation(p, n)); return p;
+}
+const PR = {
+  sky: program(FSQ_VS, SKY_FS), bh: program(FSQ_VS, BH_FS), body: program(FSQ_VS, BODY_FS), vol: program(FSQ_VS, VOL_FS),
+  part: program(PART_VS, PART_FS), spr: program(SPR_VS, SPR_FS), blit: program(FSQ_VS, BLIT_FS), acc: program(FSQ_VS, ACC_FS),
+  down: program(FSQ_VS, DOWN_FS), up: program(FSQ_VS, UP_FS), fin: program(FSQ_VS, FINAL_FS),
+};
+const emptyVAO = gl.createVertexArray();
+const sprVAO = gl.createVertexArray(), sprBuf = gl.createBuffer();
+gl.bindVertexArray(sprVAO); gl.bindBuffer(gl.ARRAY_BUFFER, sprBuf);
+for (let i = 0; i < 3; i++) { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, 4, gl.FLOAT, false, 48, i * 16); gl.vertexAttribDivisor(i, 1); }
+gl.bindVertexArray(null);
+const sprData = new Float32Array(256 * 12);
+
+function target(w, h) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, HDR ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, HDR ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { t, f, w, h };
+}
+let RT = null, qRes = 1, qPart = 1, W = 0, H = 0;
+function resize() {
+  const cssW = innerWidth, cssH = innerHeight;
+  cv.style.width = cssW + 'px';
+  cv.style.height = cssH + 'px';
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  let scale = dpr * qRes;
+  if (cssW * scale > 1920) scale = 1920 / cssW;
+  if (cssH * scale > 1200) scale = Math.min(scale, 1200 / cssH);
+  W = Math.max(320, Math.round(cssW * scale));
+  H = Math.max(240, Math.round(cssH * scale));
+  W = (W + 1) & ~1;
+  H = (H + 1) & ~1;
+  cv.width = W; cv.height = H;
+  if (RT) for (const k in RT) { const a = Array.isArray(RT[k]) ? RT[k] : [RT[k]]; for (const r of a) { gl.deleteTexture(r.t); gl.deleteFramebuffer(r.f); } }
+  const hW = W >> 1, hH = H >> 1;
+  RT = { scene: target(W, H), acc: [target(W, H), target(W, H)], vol: target(hW, hH), down: [], up: [] };
+  for (let i = 1; i <= 6; i++) {
+    const sW = Math.max(2, W >> i), sH = Math.max(2, H >> i);
+    RT.down.push(target(sW, sH));
+    RT.up.push(target(sW, sH));
+  }
+}
+addEventListener('resize', resize); resize();
+let accIdx = 0;
+
+function setCam(p, C, w, h, t) {
+  gl.uniform3fv(p.u('uCamR'), C.r); gl.uniform3fv(p.u('uCamU'), C.u); gl.uniform3fv(p.u('uCamF'), C.f);
+  gl.uniform1f(p.u('uTan'), C.tan); gl.uniform2f(p.u('uRes'), w, h); gl.uniform1f(p.u('uTime'), t);
+}
+function setSky(p, S) {
+  gl.uniform4fv(p.u('uSkyA'), S.A); gl.uniform4fv(p.u('uSkyB'), S.B); gl.uniformMatrix3fv(p.u('uSkyRot'), false, S.rot);
+  gl.uniform4fv(p.u('uGRB'), S.grb); gl.uniform4fv(p.u('uRip'), S.rip); gl.uniform1f(p.u('uRipR'), S.ripR); gl.uniform4fv(p.u('uLensGal'), S.lens);
+}
+function bindTarget(r) { gl.bindFramebuffer(gl.FRAMEBUFFER, r ? r.f : null); gl.viewport(0, 0, r ? r.w : W, r ? r.h : H); }
+function fsq() { gl.bindVertexArray(emptyVAO); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+function tex(p, name, t, unit) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(p.u(name), unit); }
+const f32 = (a, n) => { const o = new Float32Array(n); a.forEach((v, i) => o.set(v, i * 4)); return o; };
+
+const OFF = (new URLSearchParams(location.search).get('off') || '').split(',');
+function render(F, t) {
+  const C = F.cam;
+  if (OFF.includes('sky')) { F.sky = F.sky && Object.assign({}, F.sky, { A: [0, 0, 0, 0] }); }
+  if (OFF.includes('vol')) F.vol = null; if (OFF.includes('bodies')) F.bodies = []; if (OFF.includes('sprites')) F.sprites = [];
+  if (OFF.includes('parts')) F.parts = []; F.parts = F.parts.filter(p => !OFF.includes('m' + p.mode));
+  bindTarget(RT.scene); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); gl.disable(gl.BLEND);
+  // background: lensing ray tracer or plain procedural sky
+  if (F.bh) {
+    const p = PR.bh; gl.useProgram(p); setCam(p, C, W, H, t); setSky(p, F.sky);
+    gl.uniform4fv(p.u('uBH'), f32(F.bh.bh, 8)); gl.uniform4fv(p.u('uDN'), f32(F.bh.dn, 8)); gl.uniform4fv(p.u('uDP'), F.bh.dp); gl.uniform1f(p.u('uHaze'), F.bh.haze);
+    fsq();
+  } else if (F.sky) { const p = PR.sky; gl.useProgram(p); setCam(p, C, W, H, t); setSky(p, F.sky); fsq(); }
+  gl.enable(gl.BLEND);
+  if (F.bodies.length) {
+    const p = PR.body; gl.useProgram(p); setCam(p, C, W, H, t); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    const b = F.bodies.slice(0, 6);
+    gl.uniform1i(p.u('uNB'), b.length);
+    gl.uniform4fv(p.u('uBP'), f32(b.map(x => [...x.p, x.R]), 24)); gl.uniform4fv(p.u('uBT'), f32(b.map(x => [x.type, x.seed || 0, x.a || 0, x.b || 0]), 24));
+    gl.uniform4fv(p.u('uBX'), f32(b.map(x => x.X || [0, 1, 0, 0]), 24));
+    gl.uniform3fv(p.u('uLPos'), F.light.p); gl.uniform3fv(p.u('uLCol'), F.light.col);
+    fsq();
+  }
+  if (F.vol && F.vol.bright > 1e-3) {
+    const v = F.vol, p = PR.vol; gl.disable(gl.BLEND); bindTarget(RT.vol); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(p); setCam(p, C, RT.vol.w, RT.vol.h, t);
+    gl.uniform4f(p.u('uVC'), v.c[0], v.c[1], v.c[2], v.R); gl.uniform1i(p.u('uVM'), v.mode); gl.uniform4fv(p.u('uVP'), v.P);
+    gl.uniform3fv(p.u('uVA'), v.A); gl.uniform3fv(p.u('uVB'), v.B); gl.uniform1f(p.u('uVBr'), v.bright);
+    const L = (v.lights || []).slice(0, 4);
+    gl.uniform4fv(p.u('uL'), f32(L.map(l => [...l[0], l[1]]), 16));
+    const lc = new Float32Array(12); L.forEach((l, i) => lc.set(l[2], i * 3)); gl.uniform3fv(p.u('uLC'), lc);
+    fsq();
+    bindTarget(RT.scene); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(PR.blit); tex(PR.blit, 'uT', RT.vol.t, 0); gl.uniform2f(PR.blit.u('uInv'), 1 / W, 1 / H); fsq();
+  }
+  if (F.parts.length) {
+    const p = PR.part; gl.useProgram(p); setCam(p, C, W, H, t); gl.bindVertexArray(emptyVAO);
+    gl.uniform1f(p.u('uMaxPx'), MAXPT);
+    if (F.proto) gl.uniform4fv(p.u('uProto'), F.proto);
+    for (const s of F.parts) {
+      const n = Math.floor(s.count * qPart); if (n < 1 || s.bright <= 0) continue;
+      if (s.blend === 1) gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_COLOR); else gl.blendFunc(gl.ONE, gl.ONE);
+      gl.uniform1i(p.u('uMode'), s.mode); gl.uniform1ui(p.u('uSeed'), s.seed >>> 0);
+      gl.uniform3fv(p.u('uO'), s.o); gl.uniformMatrix3fv(p.u('uM'), false, s.M); gl.uniform1f(p.u('uScale'), s.scale);
+      gl.uniform4fv(p.u('uP0'), s.P0); gl.uniform4fv(p.u('uP1'), s.P1); gl.uniform4fv(p.u('uP2'), s.P2); gl.uniform4fv(p.u('uP3'), s.P3);
+      gl.uniform1f(p.u('uBright'), s.bright); gl.uniform1f(p.u('uRef'), s.ref); gl.uniform1f(p.u('uPxMin'), s.pxMin * H / 1000);
+      gl.uniform1f(p.u('uNear'), s.near); gl.uniform4fv(p.u('uHide'), s.hide);
+      gl.drawArrays(gl.POINTS, 0, n);
+    }
+  }
+  if (F.sprites.length) {
+    const p = PR.spr, n = Math.min(256, F.sprites.length); gl.useProgram(p); setCam(p, C, W, H, t); gl.uniform1f(p.u('uNear'), 1e-6);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    F.sprites.slice(0, n).forEach((s, i) => sprData.set([...s[0], s[1], ...s[2], s[3], s[4], s[5], 0, 0], i * 12));
+    gl.bindVertexArray(sprVAO); gl.bindBuffer(gl.ARRAY_BUFFER, sprBuf); gl.bufferData(gl.ARRAY_BUFFER, sprData.subarray(0, n * 12), gl.DYNAMIC_DRAW);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, n);
+  }
+  gl.disable(gl.BLEND);
+  // temporal accumulation = motion-blur approximation in fast shots
+  const cur = RT.acc[accIdx], prev = RT.acc[1 - accIdx]; accIdx = 1 - accIdx;
+  bindTarget(cur); gl.useProgram(PR.acc); tex(PR.acc, 'uCur', RT.scene.t, 0); tex(PR.acc, 'uPrev', prev.t, 1);
+  gl.uniform1f(PR.acc.u('uTrail'), F.post.trail); gl.uniform2f(PR.acc.u('uInv'), 1 / W, 1 / H); fsq();
+  // bloom pyramid (no threshold: physically-motivated glare of the whole HDR image)
+  let src = cur;
+  for (let i = 0; i < RT.down.length; i++) {
+    const d = RT.down[i]; bindTarget(d); gl.useProgram(PR.down); tex(PR.down, 'uT', src.t, 0);
+    gl.uniform2f(PR.down.u('uInv'), 1 / d.w, 1 / d.h); gl.uniform2f(PR.down.u('uSrc'), .5 / src.w, .5 / src.h); fsq(); src = d;
+  }
+  let low = RT.down[RT.down.length - 1];
+  for (let i = RT.down.length - 2; i >= 0; i--) {
+    const u = RT.up[i]; bindTarget(u); gl.useProgram(PR.up); tex(PR.up, 'uT', RT.down[i].t, 0); tex(PR.up, 'uLow', low.t, 1);
+    gl.uniform2f(PR.up.u('uInv'), 1 / u.w, 1 / u.h); gl.uniform2f(PR.up.u('uSrc'), 1 / low.w, 1 / low.h); fsq(); low = u;
+  }
+  bindTarget(null); const p = PR.fin; gl.useProgram(p); tex(p, 'uImg', cur.t, 0); tex(p, 'uBloom', low.t, 1);
+  gl.uniform2f(p.u('uRes'), W, H); gl.uniform1f(p.u('uExp'), F.post.exp); gl.uniform1f(p.u('uBloomAmt'), F.post.bloom);
+  gl.uniform1f(p.u('uFade'), F.post.fade); gl.uniform1f(p.u('uFlash'), F.post.flash); gl.uniform3fv(p.u('uFlashCol'), F.post.flashCol);
+  gl.uniform1f(p.u('uTime'), t); gl.uniform4fv(p.u('uRipS'), F.post.rip); fsq();
+}
+
+// ============================================================ SEQUENCE 1 — awakening inside a galaxy (local frame, arbitrary "ly" units)
+const L_PATH = [[0, [0, 0, 0]], [8, [0, 0, 5]], [14, [.4, .2, 28]], [20, [3, 1, 92]], [26, [1.5, 0, 188]], [31, [-2, -1, 268]],
+  [35, [-1, -.5, 316]], [38, [1.5, 0, 331]], [40, [2.5, .4, 338]]];
+const SUN = [-30, -3, 345], GG = [9, -2, 340], MOON1 = [4.5, -.8, 334.5], NEB = [-4, 2, 228], CLU = [18, 5, 118], BIN = [-70, 25, 420], PUL = [45, -12, 400];
+const NSTARS = [[6, -5, -6], [-14, 8, 10], [3, 12, 18]].map(o => V.add(NEB, o));
+const SKY_L = skyMat([.4, -.2, 1], [.35, 1, -.3]);
+const GRB_L = V.norm([-.4, .5, .77]);
+const COMET_A = [15, 9, -45], COMET_B = [25, 5, 0];
+
+function shotLocal(t) {
+  const p = spline(L_PATH, t);
+  const v = V.sub(spline(L_PATH, t + .05), spline(L_PATH, Math.max(0, t - .05)));
+  let fd = V.len(v) > 1e-6 ? V.norm(v) : [0, 0, 1];
+  fd = V.norm(V.lerp(fd, V.norm(V.sub(NEB, p)), sm(18, 22, t) * (1 - sm(24, 27, t)) * .3));
+  fd = V.norm(V.lerp(fd, V.norm(V.sub(GG, p)), sm(32.5, 37, t) * .45));
+  const C = cam(p, V.add(p, fd), [Math.sin(t * .07) * .12, 1, 0], 56), rel = relTo(C);
+  const F = newFrame(C);
+  const grb = t > 18.3 ? Math.exp(-(t - 18.3) * 4) * sm(18.3, 18.36, t) * 4 : 0;
+  F.sky = skySpec({ A: [1, .9 * sm(9, 20, t), .6 * sm(8, 20, t), .35 * sm(10, 22, t)], B: [sm(4, 16, t), .3, 0, 0], rot: SKY_L, grb: [...GRB_L, grb] });
+  // near stars: a handful at first, then thousands
+  const B = 60, rv = t < 7 ? .00012 + .004 * sm(1, 7, t) : mix(.0041, 1, Math.pow(sm(7, 15.5, t), 2));
+  F.parts.push(PS(0, 160000, [0, 0, 0], { P0: [B, rv, 0, 0], P1: [modp(p[0], B), modp(p[1], B), modp(p[2], B), 0], bright: 14 * (1 + 3 * (1 - sm(4, 12, t))), ref: 5, near: .05, seed: 11 }));
+  const fv = sm(10, 15, t) * (1 - sm(30, 34, t));
+  if (fv > 0) F.parts.push(PS(10, 70000, rel([0, 0, 150]), { P0: [70, 70, 2.5, 220], P1: [.012, 0, 0, 0], bright: 1.2 * fv, ref: 25, near: .05, seed: 12 }));
+  const cvis = sm(13, 16, t) * (1 - sm(26, 29, t));
+  if (cvis > 0) F.parts.push(PS(11, 45000, rel(CLU), { P0: [2.5, 0, 0, 0], bright: 12 * cvis, ref: 5, near: .05, seed: 13 }));
+  const nv = sm(15, 20, t) * (1 - sm(34, 38, t));
+  if (nv > 0) {
+    F.vol = { mode: 0, c: rel(NEB), R: 46, P: [1.1, .8, 0, 3.7], A: [1, .22, .18], B: [.12, .55, .75], bright: nv * .9,
+      lights: NSTARS.map((s, i) => [rel(s), 1.4, bbJS([9000, 25000, 6000][i])]) };
+    NSTARS.forEach((s, i) => sprite(F, rel(s), .3, bbJS([9000, 25000, 6000][i]), 400 / Math.max(V.len(rel(s)) ** 2, 1) * nv, .8));
+  }
+  // solar system
+  const sv = sm(25, 30, t);
+  if (sv > 0) {
+    F.light = { p: rel(SUN), col: [2.6, 2.45, 2.2] };
+    F.bodies.push({ type: 3, p: rel(SUN), R: 2.2, seed: 1, a: 5700, b: 5 * sv, X: [1, 0, 0, 0] });
+    F.bodies.push({ type: 1, p: rel(GG), R: 3, seed: 2, X: [.25, 1, .1, 1] });
+    F.bodies.push({ type: 2, p: rel(MOON1), R: .7, seed: 3 });
+    F.bodies.push({ type: 4, p: rel(PUL), R: .3, a: .8 * sv, b: 5, X: [.3, 1, .2, 45] });
+    sprite(F, rel(SUN), 2.2, bbJS(5700), 5e4 / V.dot(rel(SUN), rel(SUN)) * sv, 1, 1);
+    F.parts.push(PS(2, 160000, rel(SUN), { M: orient([.08, 1, .05]), P0: [34, 44, .9, 35], P1: [.05, .8, 0, 0], bright: 1.4 * sv, ref: 6, near: .05, seed: 14 }));
+    const ct = clamp((t - 28) / 12, 0, 1), nuc = V.lerp(COMET_A, COMET_B, ct), cvel = V.mul(V.sub(COMET_B, COMET_A), 1 / 12);
+    F.parts.push(PS(3, 60000, rel(SUN), { P0: [...nuc, 6], P1: [...cvel, 3.5], P2: [.12, .12, 0, 0], bright: 4 * sv, ref: 8, seed: 15, near: .05 }));
+    sprite(F, rel(V.add(SUN, nuc)), .1, [.8, .9, 1], 60 / Math.max(V.dot(rel(V.add(SUN, nuc)), rel(V.add(SUN, nuc))), 1) * sv, .5);
+    const a = t * TAU / 5, o = [Math.cos(a) * 1.6, Math.sin(a) * .3, Math.sin(a) * 1.6];
+    const d2 = V.dot(rel(BIN), rel(BIN));
+    sprite(F, rel(V.add(BIN, o)), .5, bbJS(4200), 3e5 / d2 * sv, 1); sprite(F, rel(V.sub(BIN, V.mul(o, .6))), .35, bbJS(18000), 4e5 / d2 * sv, 1);
+    sprite(F, rel(PUL), .3, [.7, .8, 1], 4e4 / V.dot(rel(PUL), rel(PUL)) * sv, .6);
+  }
+  F.post.trail = .45 * sm(15, 18, t) * (1 - sm(28, 31, t));
+  F.post.exp = 1.1;
+  return F;
+}
+
+// ============================================================ SEQUENCE 2 — the galaxy, its neighbours, a collision (galaxy radius = 1)
+const G_POS = [[40, [0.56, 0.01, 0.0]], [45, [0.47, 0.035, -0.27]], [50, [0.55, 0.5, -0.85]], [54, [0.3, 1.3, -1.4]], [58, [-0.8, 2.3, -2.8]], [61, [-3.2, 2.0, -4.6]], [64, [-4.7, 1.45, -5.6]]];
+const G_TGT = [[40, [0.4, 0.0, -0.45]], [45, [0.15, 0.0, -0.62]], [50, [0, 0, 0]], [54, [0, 0, 0]], [58, [-1.2, 0.3, -1.6]], [61, [-5.3, 1.2, -6.0]], [64, [-5.6, 1.15, -6.1]]];
+const CP = [-5.5, 1.2, -6.0];
+const GAL_OTHERS = [
+  { p: [3.8, .8, -3.5], n: [.3, 1, -.2], s: .7, ty: 1, c: 300000, seed: 31 },
+  { p: [-2.4, -.5, 1.8], n: [.2, 1, .4], s: .35, ty: 2, c: 90000, seed: 32, arms: 4 },
+  { p: [1.8, -.9, 2.6], n: [0, 1, 0], s: .22, ty: 1, c: 40000, seed: 33 },
+  { p: [7, -2.5, -10], n: [.6, 1, .3], s: .9, ty: 0, c: 150000, seed: 34, arms: 2, tw: 2.2 },
+  { p: [-9, 3, 1.5], n: [-.4, 1, .5], s: .6, ty: 0, c: 100000, seed: 35, arms: 3, tw: 3 },
+];
+function shotGalaxy(t) {
+  const C = cam(spline(G_POS, t), spline(G_TGT, t), [0, 1, 0], 58), rel = relTo(C);
+  const F = newFrame(C);
+  const inside = 1 - sm(44, 50, t);
+  F.sky = skySpec({ A: [.35 * inside, 0, 1, 0], B: [1, .35, 0, 0], grb: [...V.norm([.3, -.4, -.86]), t > 57 ? Math.exp(-(t - 57) * 4) * sm(57, 57.05, t) * 3 : 0] });
+  const home = orient([0, 1, 0]);
+  F.parts.push(PS(1, 1300000, rel([0, 0, 0]), { M: home, P0: [0, 2, 2.6, .12], P2: [.05, .012, 0, 0], bright: .11, near: .0005, seed: 21 }));
+  F.parts.push(PS(1, 220000, rel([0, 0, 0]), { M: home, P0: [0, 2, 2.6, .12], P2: [.05, .012, 0, 0], P3: [1, 0, 0, 0], bright: .12, blend: 1, near: .0005, seed: 22 }));
+  sprite(F, rel([0, 0, 0]), .06, [1, .8, .55], 6, 0, 2);
+  if (inside > 0) F.parts.push(PS(0, 90000, [0, 0, 0], { P0: [.04, 1, 0, 0], P1: [modp(C.p[0], .04), modp(C.p[1], .04), modp(C.p[2], .04), 0], bright: 3 * inside, ref: .003, near: .0003, seed: 23 }));
+  // a distant supernova flares in a spiral arm
+  sprite(F, rel([-.3, 0, .42]), .002, [.9, .9, 1], t > 51 ? 60 * Math.exp(-(t - 51) * .9) * sm(51, 51.15, t) : 0, 1, 1);
+  for (const g of GAL_OTHERS) {
+    const d = V.len(rel(g.p)), n = Math.min(g.c, Math.floor(g.c * clamp(1.6 * g.s / d, .15, 1)));
+    F.parts.push(PS(1, n, rel(g.p), { M: orient(g.n, g.s), scale: g.s, P0: [g.ty, g.arms || 2, g.tw || 2.6, .15], P2: [.04, .015, 0, 0], bright: .09 * g.c / n, seed: g.seed }));
+    sprite(F, rel(g.p), .04 * g.s, [1, .85, .6], 1.5, 0, 1);
+  }
+  // colliding pair: tidal tails grow as they close in
+  const sep = mix(2.0, 1.15, sm(50, 64, t)), tid = mix(.35, 1.05, sm(48, 64, t));
+  const Ac = V.add(CP, V.mul([-.6, .1, .3], sep)), Bc = V.add(CP, V.mul([.6, -.1, -.3], sep));
+  const MA = orient([.3, 1, .2], .75), MB = orient([-.5, 1, -.3], .6);
+  F.parts.push(PS(1, 450000, rel(Ac), { M: MA, scale: .75, P0: [0, 2, 2.4, .14], P1: [...toLocal(MA, V.sub(Bc, Ac)), tid], P2: [.06, .014, 0, 0], bright: .09, seed: 36 }));
+  F.parts.push(PS(1, 320000, rel(Bc), { M: MB, scale: .6, P0: [0, 2, 2.8, .12], P1: [...toLocal(MB, V.sub(Ac, Bc)), tid * .9], P2: [.07, .014, 0, 0], bright: .09, seed: 37 }));
+  sprite(F, rel(Ac), .03, [1, .85, .6], 2.5 + 20 * sm(61, 64, t), 0, 1); sprite(F, rel(Bc), .03, [1, .85, .6], 2);
+  F.post.trail = .7 * (1 - sm(40, 43, t)) + .3 * sm(62, 64, t);
+  F.post.exp = 1.25;
+  F.post.flash = 3 * sm(62.6, 64, t);
+  return F;
+}
+
+// ============================================================ SEQUENCE 3 — a supermassive black hole (rs = 1)
+const B1_POS = [[64, [0, 14, -150]], [72, [25, 8, -70]], [78, [18, 3.2, -30]], [81, [4, 2.2, -21]], [84, [-12, 5, -14]]];
+const N1 = V.norm([.08, 1, .12]), M1 = orient(N1);
+const LG1 = V.norm(V.mul(spline(B1_POS, 74), -1));
+function tidalStar(t, st, dur, r0, spd) {
+  const w0 = spd * .7071 * Math.pow(r0, -1.5);
+  if (t < st) return { r: r0, th: w0 * (t - st), x: 0 };
+  const x = clamp((t - st) / dur, 0, 1);
+  return { r: 1 + (r0 - 1) * Math.sqrt(1 - x), th: w0 * dur * 4 * (1 - Math.pow(1 - x, .25)), x };
+}
+function shotBH(t) {
+  const tg = [mix(0, -3, sm(80, 84, t)), 0, 0];
+  const C = cam(spline(B1_POS, t), tg, [0, 1, 0], 42), rel = relTo(C);
+  const F = newFrame(C);
+  F.sky = skySpec({ A: [1, .7, 1, .35], B: [1, .3, 0, 0], rot: skyMat([1, .3, .2], [.2, 1, -.4]), lens: [...LG1, .45] });
+  F.bh = { bh: [[...rel([0, 0, 0]), 1], [0, 0, 0, 0]], dn: [[...N1, 15], [0, 1, 0, 0]], dp: [3, 4.5, 1.2 * .7071, 9000], haze: .5 };
+  F.parts.push(PS(4, 360000, rel([0, 0, 0]), { M: M1, P0: [3, 16, 1.2, 0], P2: [22, 13, 68, 3], bright: .1, hide: [...rel([0, 0, 0]), 2.7], near: .05, seed: 41 }));
+  const s = tidalStar(t, 68, 13, 22, 1.2);
+  if (s.x < 1) {
+    const sp = toWorld(M1, [Math.cos(s.th) * s.r, 0, Math.sin(s.th) * s.r]);
+    sprite(F, rel(sp), .25, bbJS(5500 + s.x * 9000), 400 / V.dot(rel(sp), rel(sp)) * (1 - s.x * .6), 1, 1);
+  }
+  sprite(F, rel([0, 0, 0]), .5, [1, .8, .6], t > 81 ? 30 * Math.exp(-(t - 81) * 2) : 0, 1, 1);
+  F.post.exp = 1.0;
+  F.post.flash = 2.5 * (1 - sm(64, 65.2, t)) + 3 * sm(83, 84, t);
+  return F;
+}
+
+// ============================================================ SEQUENCE 4 — binary supermassive black holes, inspiral and merger
+const B2_POS = [[84, [0, 40, -110]], [92, [35, 30, -75]], [98, [22, 26, -58]], [104, [-18, 24, -80]]];
+const T_MERGE = 98;
+function binState(t) {
+  const a0 = 26, T = 14, x = clamp((t - 84) / T, 0, 1);
+  if (t < T_MERGE) return { sep: a0 * Math.pow(1 - x, .25), ph: .9 * T * 1.6 * (1 - Math.pow(1 - x, .625)), merged: 0 };
+  return { sep: 0, ph: .9 * T * 1.6 + (t - T_MERGE) * 1.5, merged: 1 };
+}
+function shotBinary(t) {
+  const tp = t - T_MERGE, shake = tp > 0 ? Math.exp(-tp * 1.2) * 1.2 : 0;
+  const pos = V.add(spline(B2_POS, t), [Math.sin(t * 37) * shake, Math.cos(t * 29) * shake, Math.sin(t * 23) * shake * .5]);
+  const C = cam(pos, [0, 0, 0], [0, 1, 0], 46), rel = relTo(C);
+  const F = newFrame(C), b = binState(t);
+  const A = [b.sep / 2 * Math.cos(b.ph), 0, b.sep / 2 * Math.sin(b.ph)], Bp = V.mul(A, -1);
+  const toBH = V.norm(rel([0, 0, 0]));
+  const ripA = tp > 0 ? 2.2 * Math.exp(-tp / 2.6) : 0;
+  F.sky = skySpec({ A: [1, .5, 1, .3], B: [1, .3, 0, 0], rot: skyMat([-.3, .2, 1], [.3, 1, .1]), rip: [...toBH, ripA], ripR: tp * .45 });
+  const rout = clamp(.4 * b.sep, 2.9, 10);
+  F.bh = b.merged
+    ? { bh: [[...rel([0, 0, 0]), 1.9], [0, 0, 0, 0]], dn: [[0, 1, 0, 15 * sm(0, 3, tp) + 2.9], [0, 1, 0, 0]], dp: [3, 1.2, 1.6, 10000], haze: .35 }
+    : { bh: [[...rel(A), 1], [...rel(Bp), 1]], dn: [[...V.norm([.15, 1, 0]), rout], [...V.norm([-.1, 1, .12]), rout]], dp: [3, .9, 1.6, 10000], haze: .35 };
+  F.parts.push(PS(5, 420000, rel([0, 0, 0]), { P0: [...A, 0], P1: [...Bp, 0], P2: [b.ph, b.merged ? sm(0, 2.5, tp) : 0, Math.max(tp, 0) * 38, ripA], P3: [Math.max(b.sep, .01), 0, 0, 0],
+    bright: .22 * (1 + .6 * sm(92, 98, t)), near: .05, seed: 51 }));
+  if (tp > 0) sprite(F, rel([0, 0, 0]), 1.5, [.85, .9, 1], 600 * Math.exp(-tp * 2.2), 1, 1.5);
+  const sc = [.5, .5];
+  F.post.rip = tp > 0 ? [sc[0], sc[1], tp * .3, 1.4 * Math.exp(-tp / 2)] : [.5, .5, 0, 0];
+  F.post.exp = 1.0 / (1 + (tp > 0 ? 3 * Math.exp(-tp * .8) : 0));
+  F.post.flash = 2 * (1 - sm(84, 85.2, t));
+  F.post.trail = .25 * sm(95, 98, t) * (1 - sm(99, 101, t));
+  F.post.fade = 1 - sm(103.2, 104, t);
+  return F;
+}
+
+// ============================================================ SEQUENCE 5 — a dying supergiant (stellar radius = 1)
+const SN_POS = [[104, [0, 1.2, -13]], [112, [2.5, 1.6, -11]], [113, [2.6, 1.6, -11.2]], [116, [8, 3.8, -24]], [119.5, [6, 3, -21]], [122, [2, 1.3, -8.5]]];
+const T_SN = 112.6, SN_P1 = [-4.2, .6, 2.2], SN_P2 = [3.4, -.5, -5.2];
+const snCore = tp => tp < 0 ? 0 : 3000 * Math.exp(-tp / .8) + 60 * Math.exp(-tp / 5) + 6;
+function shotSN(t) {
+  const C = cam(spline(SN_POS, t), [0, 0, 0], [Math.sin(t * .1) * .1, 1, 0], 50), rel = relTo(C);
+  const F = newFrame(C), tp = t - T_SN;
+  F.sky = skySpec({ A: [.8, .3, 1, .4], B: [1, .3, 0, 0], rot: skyMat([.2, -1, .3], [1, .2, .1]) });
+  const core = snCore(tp);
+  if (tp < .15) {
+    const A = .02 + .07 * sm(104, 112, t);
+    const R = (1 + A * Math.sin(TAU * t / 1.1) + .02 * Math.sin(t * 7.3)) * (1 - .22 * sm(112, T_SN, t));
+    const br = .75 * (1 + .35 * Math.sin(TAU * t / 1.1 + .6)) * (1 - .5 * sm(112, T_SN, t));
+    F.bodies.push({ type: 3, p: rel([0, 0, 0]), R, seed: 5, a: 3400, b: br, X: [1.3, 1, 0, 0] });
+    F.light = { p: rel([0, 0, 0]), col: V.mul(bbJS(3400), 1.6 * br / .75) };
+    sprite(F, rel([0, 0, 0]), R, bbJS(3400), br * .6, 0, .8);
+  } else F.light = { p: rel([0, 0, 0]), col: V.mul(bbJS(12000), .02 * core + 1.2) };
+  F.bodies.push({ type: 0, p: rel(SN_P1), R: .32, seed: 7 });
+  F.bodies.push({ type: 0, p: rel(SN_P2), R: .22, seed: 9 });
+  const Rsh = tp > 0 ? 1 + 13 * (1 - Math.exp(-tp / 4.5)) : 0;
+  F.parts.push(PS(6, 130000, rel([0, 0, 0]), { P0: [tp, 0, 1, 0], P1: [Rsh * 1.02, 1, 0, 0], bright: 1.4, ref: 1e6, near: .02, seed: 61 }));
+  if (tp > 0) {
+    F.parts.push(PS(6, 260000, rel([0, 0, 0]), { P0: [tp, 14, 1, 2.3], P1: [0, 0, 0, 0], bright: .9, near: .02, seed: 62 }));
+    const vR = Rsh * 1.35 + 1.5;
+    F.vol = { mode: 1, c: rel([0, 0, 0]), R: vR, P: [3 * Math.exp(-tp / 2), .55, Rsh / vR, 4.1], A: [1, .25, .18], B: [.2, .8, .9], bright: .7 * sm(0, .4, tp),
+      lights: [[rel([0, 0, 0]), .01 * core + .6, [1, .9, .8]]] };
+    sprite(F, rel([0, 0, 0]), .4, [1, .95, .9], core, 1, 1.4);
+  }
+  if (tp > 2.5) F.bodies.push({ type: 4, p: rel([0, 0, 0]), R: .06, a: 3 * sm(2.5, 4.5, tp), b: 4.5, X: [.2, 1, .4, 25] });
+  F.post.exp = 1 / (1 + .004 * snCore(tp - .6));
+  F.post.fade = sm(104, 104.25, t);
+  F.post.flash = tp > 0 ? 1.5 * Math.exp(-tp * 3) : 0;
+  F.post.flashCol = [1, .9, .8];
+  F.post.trail = tp > 0 && tp < 2 ? .35 : 0;
+  return F;
+}
+
+// ============================================================ SEQUENCE 6 — stars being born inside a molecular cloud (cloud radius = 12)
+const BR_POS = [[122, [0, 1, -11]], [129, [2.2, 1.6, -7]], [136, [-1, .8, -3.8]]];
+const BR_TGT = [[122, [0, 0, 0]], [136, [0, 0, 2]]];
+const PROTO = (() => { const r = rng(777), a = new Float32Array(96);
+  for (let i = 0; i < 24; i++) { const d = V.norm([r() - .5, (r() - .5) * .6, r() - .5]), rad = 1 + 6 * Math.sqrt(r());
+    a.set([d[0] * rad, d[1] * rad, d[2] * rad + 1.5, 123.5 + i * .45 + r() * .8], i * 4); } return a; })();
+function shotBirth(t) {
+  const C = cam(spline(BR_POS, t), spline(BR_TGT, t), [0, 1, 0], 54), rel = relTo(C);
+  const F = newFrame(C);
+  F.sky = skySpec({ A: [.25, 0, .3, .2], B: [1, .2, 0, 0] });
+  F.proto = PROTO;
+  const lights = [];
+  for (let i = 0; i < 24; i++) {
+    const p = [PROTO[i * 4], PROTO[i * 4 + 1], PROTO[i * 4 + 2]], on = sm(PROTO[i * 4 + 3], PROTO[i * 4 + 3] + 2.5, t);
+    const col = bbJS(mix(2500, 8000, on)), rp = rel(p);
+    lights.push([rp, .15 + 2.5 * on, col, on / Math.max(V.dot(rp, rp), .5)]);
+    sprite(F, rp, .02, col, (.05 + 12 * on) / Math.max(V.dot(rp, rp), .3), on, 1);
+  }
+  lights.sort((a, b) => b[3] - a[3]);
+  F.vol = { mode: 2, c: rel([0, 0, 0]), R: 12, P: [.8, 2.2, 0, 0], A: [1, .32, .16], B: [.35, .2, .45], bright: .9, lights: lights.slice(0, 4) };
+  F.parts.push(PS(7, 360000, rel([0, 0, 0]), { bright: .6, ref: 3, near: .02, seed: 71 }));
+  F.post.exp = 1.15;
+  F.post.flash = 1.2 * (1 - sm(122, 123.5, t)); F.post.flashCol = [1, .6, .4];
+  F.post.fade = 1 - sm(135.5, 136, t);
+  return F;
+}
+
+// ============================================================ SEQUENCE 7 — powers of ten, in metres (double precision; each layer rendered camera-relative in its own unit)
+const AU = 1.496e11, PC = 3.086e16, KPC = PC * 1e3, MPC = PC * 1e6, RE = 6.371e6, RSUN = 6.96e8, RMOON = 1.737e6;
+const S0 = [0, 0, 0];
+const Ug = 15 * KPC, S_GAL = [-.035, 0, -.532];                    // our star sits on a spiral arm
+const GAL = [-S_GAL[0] * Ug, 0, -S_GAL[2] * Ug];
+const Uc = 2 * MPC, CLUS = V.add(GAL, [.35 * Uc, .1 * Uc, -.2 * Uc]);
+const Uw = 40 * MPC;
+const EARTH = [AU * Math.cos(2.2), 0, AU * Math.sin(2.2)], En = V.norm(EARTH);
+const NEBW = [9 * PC, 2 * PC, 6 * PC], NEBR = 7 * PC, CLUW = [1.2 * PC, .3 * PC, -.8 * PC];
+const CITYN = V.norm([En[0] * .92 - En[2] * .3, .28, En[2] * .92 + En[0] * .3]), CITY = V.add(EARTH, V.mul(CITYN, RE));
+const SKY_Z = skyMat(V.norm(V.sub(GAL, S0)), [0, 1, 0]);
+const LKEYS = [[136, 11.8], [138, 12.7], [141, 16.4], [143.5, 18.1], [146, 20.3], [148.2, 21.4], [150.3, 23.0], [152.6, 25.1], [154.2, 25.3],
+  [156, 24.1], [157.5, 22.3], [159, 20.2], [160.5, 17.6], [161.8, 13.6], [162.9, 10.3], [164, 8.3], [165, 7.4], [166.2, 4.7], [167.2, 4.62], [168.4, 27.5]];
+const T_IN = 154.2;
+const dirOut = t => { const a = .03 * (t - 136), d = V.norm([.35, .5, -.79]); return V.norm([d[0] * Math.cos(a) - d[2] * Math.sin(a), d[1], d[0] * Math.sin(a) + d[2] * Math.cos(a)]); };
+function focusOut(L) { let F = S0; F = V.lerp(F, GAL, sm(19.8, 21, L)); return V.lerp(F, CLUS, sm(21.9, 22.9, L)); }
+function focusIn(L) {
+  let F = CITY; F = V.lerp(F, EARTH, sm(7.3, 8.3, L)); F = V.lerp(F, S0, sm(9.5, 12.2, L));
+  F = V.lerp(F, NEBW, sm(16.2, 17.2, L) * (1 - sm(17.6, 18.6, L)));
+  F = V.lerp(F, GAL, sm(20, 21.2, L)); return V.lerp(F, CLUS, sm(22.2, 23, L));
+}
+const cityT = V.norm(V.cross(CITYN, [0, 1, 0]));
+const DIRS = [[4.6, V.norm(V.add(V.mul(CITYN, .8), V.mul(cityT, .6)))], [6.5, V.norm(V.add(V.mul(CITYN, .7), V.mul(cityT, .7)))],
+  [8, V.norm(V.add(V.lerp(V.mul(En, -1), CITYN, .55), [0, .3, 0]))], [11, V.norm([.3, .45, -.84])], [15, V.norm([.1, .12, -1])],
+  [18, V.norm([-.5, .2, -.84])], [20.5, V.norm([.3, .18, -.94])], [23, V.norm([.2, .4, -.9])], [25.3, dirOut(T_IN)]];
+function dirIn(L) {
+  if (L <= DIRS[0][0]) return DIRS[0][1]; if (L >= DIRS[DIRS.length - 1][0]) return DIRS[DIRS.length - 1][1];
+  let i = 0; while (L > DIRS[i + 1][0]) i++;
+  return V.norm(V.lerp(DIRS[i][1], DIRS[i + 1][1], sm(DIRS[i][0], DIRS[i + 1][0], L)));
+}
+const MOONW = (() => { const L = 7.8, D = 10 ** L, f = focusIn(L), d = dirIn(L), cp = V.add(f, V.mul(d, D));
+  const r = V.norm(V.cross(V.mul(d, -1), [0, 1, 0])); return V.add(V.add(cp, V.mul(d, -.33 * D)), V.mul(r, .12 * D)); })();
+
+function shotZoom(t) {
+  const L = mono(LKEYS, t), D = 10 ** L, inPhase = t >= T_IN;
+  const Fp = inPhase ? focusIn(L) : focusOut(L), dir = inPhase ? dirIn(L) : dirOut(t);
+  const cp = V.add(Fp, V.mul(dir, D));
+  const C = cam(cp, Fp, [0, 1, 0], 52), F = newFrame(C);
+  const relU = (P, U) => V.mul(V.sub(P, cp), 1 / U);
+  const inner = 1 - sm(16.8, 18.2, L);
+  F.sky = skySpec({ A: [inner, inner * .8, inner * .7, inner * .3], B: [1, .15 + .5 * sm(22, 25.5, L), 0, 0], rot: SKY_Z });
+  // solar system — bodies in units of the current camera distance
+  const Ub = D;
+  if (L < 12.6) {
+    F.light = { p: relU(S0, Ub), col: [1.7, 1.65, 1.55] };
+    F.bodies.push({ type: 3, p: relU(S0, Ub), R: RSUN / Ub, seed: 1, a: 5800, b: 5, X: [1, .2, 0, 0] });
+    if (L < 11) F.bodies.push({ type: 5, p: relU(EARTH, Ub), R: RE / Ub, seed: 4.2, a: 4, X: [...relU(CITY, Ub), Ub / 220] });
+    if (L < 9.6) F.bodies.push({ type: 2, p: relU(MOONW, Ub), R: RMOON / Ub, seed: 6 });
+  }
+  const dS = V.len(V.sub(S0, cp));
+  sprite(F, relU(S0, Ub), RSUN / Ub, bbJS(5800), clamp(30 * (1e12 / dS) ** 2, 1.2, 300) * (1 - sm(17.3, 18.3, L)), 1, 1);
+  if (L > 9 && L < 13) sprite(F, relU(EARTH, Ub), RE / Ub, [.5, .7, 1], .6 * vis(L, 9, 9.8, 12, 13));
+  // stellar neighbourhood (parsecs)
+  let v = vis(L, 14.6, 15.6, 17.6, 18.6);
+  if (v > 0) { const cq = V.mul(cp, 1 / PC), B = 12;
+    F.parts.push(PS(0, 110000, [0, 0, 0], { P0: [B, 1, 0, 0], P1: [modp(cq[0], B), modp(cq[1], B), modp(cq[2], B), 0], bright: 20 * v, ref: 1, near: .002, seed: 81 })); }
+  v = vis(L, 15.2, 16.3, 18.3, 19.3);
+  if (v > 0) F.parts.push(PS(11, 60000, relU(CLUW, PC), { P0: [1.5, 0, 0, 0], bright: 8 * v, ref: 2, near: .002, seed: 82 }));
+  v = vis(L, 16, 16.8, 18.8, 19.6);
+  if (v > 0) F.vol = { mode: 0, c: relU(NEBW, PC), R: NEBR / PC, P: [1.2, .8, 0, 9.1], A: [.25, .55, 1], B: [1, .3, .45], bright: v,
+    lights: [[relU(V.add(NEBW, [2 * PC, 1 * PC, 0]), PC), 1.5, [.7, .8, 1]]] };
+  // the galaxy (15 kpc units)
+  v = vis(L, 18, 19, 22.6, 23.3);
+  if (v > 0) { const o = relU(GAL, Ug);
+    F.parts.push(PS(1, 1300000, o, { P0: [0, 2, 2.6, .12], P2: [0, .012, 0, 0], bright: .05 * v, near: 1e-7, seed: 21 }));
+    F.parts.push(PS(1, 200000, o, { P0: [0, 2, 2.6, .12], P2: [0, .012, 0, 0], P3: [1, 0, 0, 0], bright: .5 * v, blend: 1, near: 1e-7, seed: 22 }));
+    sprite(F, o, .06, [1, .8, .55], 3 * v, 0, 1.5); }
+  // galaxy cluster (2 Mpc units): each point is a galaxy
+  v = vis(L, 21.7, 22.4, 24.2, 25);
+  if (v > 0) { F.parts.push(PS(9, 160000, relU(CLUS, Uc), { bright: .12 * v, near: 1e-7, seed: 91 }));
+    sprite(F, relU(GAL, Uc), .008, [1, .85, .65], 2 * vis(L, 22, 22.6, 23.6, 24.2), 0, 1); }
+  // cosmic web (40 Mpc units); matter drifts along filaments into the nodes
+  v = sm(23, 23.9, L);
+  if (v > 0) F.parts.push(PS(8, 950000, relU(CLUS, Uw), { P0: [9, .018, .003, 0], P1: [4, 4, 4, 0], bright: .05 * v, near: 1e-7, seed: 101 }));
+  const spd = Math.abs(mono(LKEYS, t + .05) - mono(LKEYS, t - .05)) * 10;
+  F.post.trail = clamp(spd * .12, 0, .8);
+  F.post.exp = 1.1;
+  F.post.fade = sm(136, 136.5, t);
+  F.post.flash = 2 * sm(167.9, 168.4, t);
+  return F;
+}
+
+// ============================================================ SEQUENCE 8 — it was all a single glowing mote orbiting a black hole
+const NF = V.norm([.05, 1, .1]), MF = orient(NF), TF0 = 168.4, TF_FALL = 171.4, FALL_D = 1.9, SPD_F = 20;
+function shotFinal(t) {
+  const s = tidalStar(t, TF_FALL, FALL_D, 7, SPD_F);
+  const pp = toWorld(MF, [Math.cos(s.th) * s.r, 0, Math.sin(s.th) * s.r]);
+  const camEnd = [-8, 3.6, -36], e = sm(TF0, 171, t);
+  const dEnd = V.len(V.sub(camEnd, pp)), d = Math.exp(mix(Math.log(.06), Math.log(dEnd), e));
+  const cp = V.add(pp, V.mul(V.norm(V.sub(camEnd, pp)), d));
+  const C = cam(cp, V.lerp(pp, [0, 0, 0], e), [0, 1, 0], 44), rel = relTo(C);
+  const F = newFrame(C);
+  F.sky = skySpec({ A: [1, .5, 1, .25], B: [1, .3, 0, 0], rot: skyMat([.6, -.2, 1], [-.2, 1, .3]) });
+  F.bh = { bh: [[...rel([0, 0, 0]), 1], [0, 0, 0, 0]], dn: [[...NF, 12], [0, 1, 0, 0]], dp: [3, 1.2, 1.1, 8000], haze: .4 };
+  F.parts.push(PS(4, 200000, rel([0, 0, 0]), { M: MF, P0: [3, 13, 1.1, 0], P2: [7, FALL_D, TF_FALL, 0], bright: .4, hide: [...rel([0, 0, 0]), 2.7], near: .01, seed: 111 }));
+  F.parts.push(PS(4, 70000, rel([0, 0, 0]), { M: MF, P0: [3, 13, SPD_F, 0], P2: [7, FALL_D, TF_FALL, 2.5], P3: [1, 0, 0, 0], bright: .8, hide: [...rel([0, 0, 0]), 2.7], near: .01, seed: 112 }));
+  const rp = rel(pp);
+  if (s.x < 1) sprite(F, rp, .04, [1, .9, .7], Math.min(3 / Math.max(V.dot(rp, rp), 1e-3), 300) * (1 - s.x * .7), 1, 1.2);
+  sprite(F, rel([0, 0, 0]), .3, [1, .85, .7], t > 173.3 ? 25 * Math.exp(-(t - 173.3) * 6) : 0, 1, 1);
+  F.post.flash = 2 * (1 - sm(TF0, TF0 + .8, t));
+  F.post.exp = 1.0;
+  return F;
+}
+function shotEnd(t) {
+  const C = cam([0, 0, 0], [0, 0, 1], [0, 1, 0], 50), F = newFrame(C);
+  sprite(F, [0, 0, 60], .02, bbJS(6500), sm(176, 177.6, t) * (1 - sm(179.2, 180, t)) * 2.5 * (1 + .08 * Math.sin(t * 3)), .6, 1);
+  return F;
+}
+
+// ============================================================ timeline + playback
+const SHOTS = [[0, 40, shotLocal], [40, 64, shotGalaxy], [64, 84, shotBH], [84, 104, shotBinary], [104, 122, shotSN], [122, 136, shotBirth],
+  [136, TF0, shotZoom], [TF0, 173.6, shotFinal], [173.6, 180, shotEnd]];
+const DUR = 180;
+function frameAt(t) {
+  const s = SHOTS.find(s => t < s[1]) || SHOTS[SHOTS.length - 1];
+  const F = s[2](t);
+  F.post.fade *= sm(0, 1.8, t) * (1 - .92 * bump(t, 40, .25));
+  return F;
+}
+let T = 0, paused = false, last = performance.now(), ftA = 0, ftN = 0;
+const q0 = new URLSearchParams(location.search);
+if (q0.get('t')) T = parseFloat(q0.get('t')) || 0;
+if (q0.get('p')) paused = true;
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  else if (e.code === 'ArrowRight') T = Math.min(DUR - .01, T + 10);
+  else if (e.code === 'ArrowLeft') T = Math.max(0, T - 10);
+  else if (e.code === 'KeyR') T = 0;
+  else if (e.code === 'KeyF') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
+});
+cv.addEventListener('dblclick', () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.());
+function loop(now) {
+  requestAnimationFrame(loop);
+  const raw = (now - last) / 1000; last = now;
+  if (!paused) { T += Math.min(raw, .1); if (T >= DUR) T = 0;
+    ftA += raw; ftN++;
+    if (ftN >= 60) { const a = ftA / ftN; ftA = 0; ftN = 0;
+      if (a > .028) { if (qPart > .45) qPart *= .85; else if (qRes > .55) { qRes *= .88; resize(); } }
+      else if (a < .014) { if (qRes < 1) { qRes = Math.min(1, qRes / .92); resize(); } else if (qPart < 1) qPart = Math.min(1, qPart / .9); } } }
+  render(frameAt(T), T);
+}
+window.__cosmos = { get t() { return T; }, set t(v) { T = v; }, get q() { return [qRes, qPart, W, H]; }, pause(v) { paused = v; } };
+requestAnimationFrame(loop);
+
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+# Editor & Agent state
+.omc/
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
